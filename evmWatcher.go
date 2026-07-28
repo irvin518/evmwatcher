@@ -26,6 +26,7 @@ const (
 	// interval of getting the node head and reporting it through SetWatchedBlockNumber
 	checkpointInterval  = 2 * time.Minute
 	logChannelBuffer    = 4096
+	eventChannelBuffer  = 4096
 	resubscribeDelay    = 5 * time.Second
 	rateLimitBackoff    = time.Second
 	maxRateLimitBackoff = 30 * time.Second
@@ -78,6 +79,7 @@ type EVMWatcher struct {
 	targets     map[common.Address]*watchTarget
 	lastBlock   uint64
 	logCh       chan types.Log
+	eventCh     chan *Event
 	sub         ethereum.Subscription
 	started     bool
 	// streaming is true only when the log subscription is alive and the gap it
@@ -177,8 +179,14 @@ func (e *EVMWatcher) Start() error {
 	e.ethClient = client
 	e.targets = targets
 	e.logCh = make(chan types.Log, logChannelBuffer)
+	e.eventCh = make(chan *Event, eventChannelBuffer)
 	e.ctx, e.cancel = ctx, cancel
 	e.mu.Unlock()
+
+	// The consumer has to run before the scan starts, otherwise the events
+	// decoded while catching up would fill eventCh and block the scan.
+	e.wg.Add(1)
+	go e.notifyLoop()
 
 	// Subscribe before catching up, the pushed logs are buffered in logCh so
 	// that nothing is missed between the scan end and the stream start.
@@ -485,7 +493,10 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		e.logf("failed to decode event %s of %s: %v", event.Name, vLog.Address.Hex(), err)
 		return
 	}
-	if err := e.event.OnEvent(e.chainName, &Event{
+	// Hand the event over to notifyLoop, a slow OnEvent must not block the log
+	// stream and make the node drop the subscription.
+	select {
+	case e.eventCh <- &Event{
 		ContractAddress: vLog.Address,
 		EventName:       event.Name,
 		BlockNumber:     vLog.BlockNumber,
@@ -496,8 +507,38 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		Args:            args,
 		Removed:         vLog.Removed,
 		Raw:             vLog,
-	}); err != nil {
-		e.logf("failed to notify event %s of %s: %v", event.Name, vLog.Address.Hex(), err)
+	}:
+	case <-e.context().Done():
+	}
+}
+
+// notifyLoop delivers the events to the caller, it is the only goroutine calling
+// OnEvent so the delivery order stays the same as the chain order.
+func (e *EVMWatcher) notifyLoop() {
+	defer e.wg.Done()
+
+	ctx := e.context()
+	for {
+		select {
+		case event := <-e.eventCh:
+			e.notify(event)
+		case <-ctx.Done():
+			// Deliver the already decoded events before leaving.
+			for {
+				select {
+				case event := <-e.eventCh:
+					e.notify(event)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (e *EVMWatcher) notify(event *Event) {
+	if err := e.event.OnEvent(e.chainName, event); err != nil {
+		e.logf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
 	}
 }
 
@@ -673,6 +714,7 @@ func (e *EVMWatcher) release(cancel context.CancelFunc, client *ethclient.Client
 		sub.Unsubscribe()
 	}
 	cancel()
+	e.wg.Wait()
 	client.Close()
 }
 
