@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -93,6 +94,17 @@ type EVMWatcher struct {
 	requestInterval time.Duration
 	rpcMu           sync.Mutex
 	lastRequest     time.Time
+
+	// pendingEvents counts the events decoded but not yet handed to OnEvent,
+	// deliveredBlock is the highest block an event has been delivered for.
+	// Together they tell how far the delivery lags behind the scan cursor.
+	pendingEvents  atomic.Int64
+	deliveredBlock atomic.Uint64
+	// reportedBlock is the watermark persisted through SetWatchedBlockNumber,
+	// it never regresses. Guarded by reportMu, which is held across the storage
+	// call so the writes cannot land out of order.
+	reportMu      sync.Mutex
+	reportedBlock uint64
 
 	reloadCh chan struct{}
 	ctx      context.Context
@@ -212,6 +224,12 @@ func (e *EVMWatcher) Start() error {
 	} else {
 		e.setLastBlock(uint64(stored))
 	}
+	// Everything up to the starting point was delivered by the previous run.
+	initial := e.getLastBlock()
+	e.deliveredBlock.Store(initial)
+	e.reportMu.Lock()
+	e.reportedBlock = initial
+	e.reportMu.Unlock()
 
 	// The node head is ahead of the recorded progress, scan the gap first.
 	if err := e.backfill(ctx, head); err != nil {
@@ -359,9 +377,7 @@ func (e *EVMWatcher) checkpointLoop() {
 				continue
 			}
 			e.setLastBlock(head)
-			if err := e.storage.SetWatchedBlockNumber(e.chainName, head); err != nil {
-				e.logf("failed to save watched block number %d: %v", head, err)
-			}
+			e.reportWatermark(head)
 		}
 	}
 }
@@ -395,9 +411,7 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 		}
 
 		e.setLastBlock(scanned)
-		if err := e.storage.SetWatchedBlockNumber(e.chainName, scanned); err != nil {
-			return fmt.Errorf("failed to save watched block number %d: %w", scanned, err)
-		}
+		e.reportWatermark(scanned)
 	}
 }
 
@@ -493,8 +507,9 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		e.logf("failed to decode event %s of %s: %v", event.Name, vLog.Address.Hex(), err)
 		return
 	}
-	// Hand the event over to notifyLoop, a slow OnEvent must not block the log
-	// stream and make the node drop the subscription.
+	// Hand the event over to notifyLoop. Counted before sending so that the
+	// event is part of the backlog even while the send blocks.
+	e.pendingEvents.Add(1)
 	select {
 	case e.eventCh <- &Event{
 		ContractAddress: vLog.Address,
@@ -509,6 +524,7 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		Raw:             vLog,
 	}:
 	case <-e.context().Done():
+		e.pendingEvents.Add(-1)
 	}
 }
 
@@ -540,6 +556,47 @@ func (e *EVMWatcher) notify(event *Event) {
 	if err := e.event.OnEvent(e.chainName, event); err != nil {
 		e.logf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
 	}
+	// Rescanned duplicates may carry lower numbers, keep the maximum. notifyLoop
+	// is the only writer.
+	if event.BlockNumber > e.deliveredBlock.Load() {
+		e.deliveredBlock.Store(event.BlockNumber)
+	}
+	e.pendingEvents.Add(-1)
+}
+
+// hasBacklog reports whether some received logs or decoded events are still on
+// their way to the caller.
+func (e *EVMWatcher) hasBacklog() bool {
+	return e.pendingEvents.Load() > 0 || len(e.logCh) > 0
+}
+
+// reportWatermark persists the progress through SetWatchedBlockNumber. candidate
+// is the block the scan or the stream has reached; while undelivered events
+// remain, only the block before the oldest undelivered one is safe to persist,
+// otherwise a crash would lose the queued events for good.
+func (e *EVMWatcher) reportWatermark(candidate uint64) {
+	if e.hasBacklog() {
+		delivered := e.deliveredBlock.Load()
+		if delivered == 0 {
+			return
+		}
+		// The oldest undelivered event may sit in the same block as the last
+		// delivered one, so only the block before it is safe.
+		if delivered-1 < candidate {
+			candidate = delivered - 1
+		}
+	}
+
+	e.reportMu.Lock()
+	defer e.reportMu.Unlock()
+	if candidate <= e.reportedBlock {
+		return
+	}
+	if err := e.storage.SetWatchedBlockNumber(e.chainName, candidate); err != nil {
+		e.logf("failed to save watched block number %d: %v", candidate, err)
+		return
+	}
+	e.reportedBlock = candidate
 }
 
 func (e *EVMWatcher) subscribe() error {
