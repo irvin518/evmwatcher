@@ -11,5 +11,5 @@ type StorageInterface interface {
 type EventInterface interface {
 	// OnEvent is called with the chain the event belongs to, so that one
 	// implementation can serve several chains.
-	OnEvent(chainName string, event any) error
+	OnEvent(chainName string, event *Event) error
 }
