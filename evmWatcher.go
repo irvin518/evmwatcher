@@ -25,12 +25,15 @@ const (
 	// provider rate limit
 	defaultRequestInterval = 200 * time.Millisecond
 	// interval of getting the node head and reporting it through SetWatchedBlockNumber
-	checkpointInterval  = 2 * time.Minute
-	logChannelBuffer    = 4096
-	eventChannelBuffer  = 4096
-	resubscribeDelay    = 5 * time.Second
-	rateLimitBackoff    = time.Second
-	maxRateLimitBackoff = 30 * time.Second
+	checkpointInterval = 2 * time.Minute
+	logChannelBuffer   = 4096
+	eventChannelBuffer = 4096
+	resubscribeDelay   = 5 * time.Second
+	// minimum gap between two delivery-driven watermark writes, keeps a busy
+	// stream from turning into one storage write per block
+	deliveryReportInterval = 5 * time.Second
+	rateLimitBackoff       = time.Second
+	maxRateLimitBackoff    = 30 * time.Second
 )
 
 // WatcherData describes one contract and the events watched on it.
@@ -103,8 +106,9 @@ type EVMWatcher struct {
 	// reportedBlock is the watermark persisted through SetWatchedBlockNumber,
 	// it never regresses. Guarded by reportMu, which is held across the storage
 	// call so the writes cannot land out of order.
-	reportMu      sync.Mutex
-	reportedBlock uint64
+	reportMu           sync.Mutex
+	reportedBlock      uint64
+	lastDeliveryReport time.Time
 
 	reloadCh chan struct{}
 	ctx      context.Context
@@ -267,6 +271,8 @@ func (e *EVMWatcher) Stop() {
 		sub.Unsubscribe()
 	}
 	e.wg.Wait()
+	// Flush the final watermark after the pending events are drained.
+	e.reportWatermark(e.getLastBlock())
 	if client != nil {
 		client.Close()
 	}
@@ -553,15 +559,37 @@ func (e *EVMWatcher) notifyLoop() {
 }
 
 func (e *EVMWatcher) notify(event *Event) {
-	if err := e.event.OnEvent(e.chainName, event); err != nil {
+	err := e.event.OnEvent(e.chainName, event)
+	e.pendingEvents.Add(-1)
+	if err != nil {
+		// Do not advance the watermark on failure, so a restart can rescan
+		// this block and deliver the event again.
 		e.logf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
+		return
 	}
-	// Rescanned duplicates may carry lower numbers, keep the maximum. notifyLoop
-	// is the only writer.
+	// Persist progress right after a successful delivery, so a restart will not
+	// reprocess the same event.
 	if event.BlockNumber > e.deliveredBlock.Load() {
 		e.deliveredBlock.Store(event.BlockNumber)
 	}
-	e.pendingEvents.Add(-1)
+	e.setLastBlock(event.BlockNumber)
+	e.reportDelivered(event.BlockNumber)
+}
+
+// reportDelivered persists the delivery progress at most once every
+// deliveryReportInterval. The final flush in Stop bypasses the throttle by
+// calling reportWatermark directly.
+func (e *EVMWatcher) reportDelivered(blockNumber uint64) {
+	e.reportMu.Lock()
+	throttled := time.Since(e.lastDeliveryReport) < deliveryReportInterval
+	if !throttled {
+		e.lastDeliveryReport = time.Now()
+	}
+	e.reportMu.Unlock()
+	if throttled {
+		return
+	}
+	e.reportWatermark(blockNumber)
 }
 
 // hasBacklog reports whether some received logs or decoded events are still on
