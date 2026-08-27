@@ -34,6 +34,7 @@ const (
 	deliveryReportInterval = 5 * time.Second
 	rateLimitBackoff       = time.Second
 	maxRateLimitBackoff    = 30 * time.Second
+	defaultPollInterval    = 3 * time.Second
 )
 
 // WatcherData describes one contract and the events watched on it.
@@ -98,6 +99,14 @@ type EVMWatcher struct {
 	rpcMu           sync.Mutex
 	lastRequest     time.Time
 
+	// confirmations delays delivery and watermark until a block is N blocks
+	// behind the chain head. 0 keeps the live subscription path.
+	confirmations uint64
+	pollInterval  time.Duration
+	// latestHead is the freshest BlockNumber we have seen, used to clamp
+	// watermarks and Stop flush to safeHead without an extra RPC.
+	latestHead atomic.Uint64
+
 	// pendingEvents counts the events decoded but not yet handed to OnEvent,
 	// deliveredBlock is the highest block an event has been delivered for.
 	// Together they tell how far the delivery lags behind the scan cursor.
@@ -137,6 +146,23 @@ func WithRequestInterval(interval time.Duration) Option {
 	}
 }
 
+// WithConfirmations delays delivery and watermark until a block is N blocks
+// behind the chain head. 0 (default) keeps the current immediate-delivery behavior.
+func WithConfirmations(n uint64) Option {
+	return func(e *EVMWatcher) {
+		e.confirmations = n
+	}
+}
+
+// WithPollInterval sets the poll interval used when confirmations > 0.
+func WithPollInterval(d time.Duration) Option {
+	return func(e *EVMWatcher) {
+		if d > 0 {
+			e.pollInterval = d
+		}
+	}
+}
+
 func NewEVMWatcher(chainName, wssURL string, watcherData []WatcherData, storage StorageInterface, event EventInterface, options ...Option) *EVMWatcher {
 	watcher := &EVMWatcher{
 		chainName:       chainName,
@@ -147,6 +173,7 @@ func NewEVMWatcher(chainName, wssURL string, watcherData []WatcherData, storage 
 		targets:         make(map[common.Address]*watchTarget),
 		maxBlockRange:   defaultMaxBlockRange,
 		requestInterval: defaultRequestInterval,
+		pollInterval:    defaultPollInterval,
 		reloadCh:        make(chan struct{}, 1),
 	}
 	for _, option := range options {
@@ -204,27 +231,26 @@ func (e *EVMWatcher) Start() error {
 	e.wg.Add(1)
 	go e.notifyLoop()
 
-	// Subscribe before catching up, the pushed logs are buffered in logCh so
-	// that nothing is missed between the scan end and the stream start.
-	if err := e.subscribe(); err != nil {
-		e.release(cancel, client)
-		return err
-	}
-
 	head, err := e.blockNumber(ctx)
 	if err != nil {
 		e.release(cancel, client)
 		return fmt.Errorf("failed to get block number: %w", err)
 	}
+	e.latestHead.Store(head)
 
 	stored, err := e.storage.GetWatchedBlockNumber(e.chainName)
 	if err != nil {
 		e.release(cancel, client)
 		return fmt.Errorf("failed to get watched block number: %w", err)
 	}
+
+	startAt := head
+	if e.confirmations > 0 {
+		startAt = e.safeHead(head)
+	}
 	if stored < 0 {
-		// no progress recorded, watch from the current node head
-		e.setLastBlock(head)
+		// no progress recorded, watch from the current (safe) head
+		e.setLastBlock(startAt)
 	} else {
 		e.setLastBlock(uint64(stored))
 	}
@@ -234,6 +260,32 @@ func (e *EVMWatcher) Start() error {
 	e.reportMu.Lock()
 	e.reportedBlock = initial
 	e.reportMu.Unlock()
+
+	if e.confirmations > 0 {
+		// Plan A: no live subscription. Only deliver and advance up to safeHead.
+		if startAt > 0 && e.getLastBlock() < startAt {
+			if err := e.backfill(ctx, startAt); err != nil {
+				e.release(cancel, client)
+				return err
+			}
+		}
+
+		e.mu.Lock()
+		e.started = true
+		e.streaming = true
+		e.mu.Unlock()
+
+		e.wg.Add(1)
+		go e.confirmationLoop()
+		return nil
+	}
+
+	// Subscribe before catching up, the pushed logs are buffered in logCh so
+	// that nothing is missed between the scan end and the stream start.
+	if err := e.subscribe(); err != nil {
+		e.release(cancel, client)
+		return err
+	}
 
 	// The node head is ahead of the recorded progress, scan the gap first.
 	if err := e.backfill(ctx, head); err != nil {
@@ -272,7 +324,15 @@ func (e *EVMWatcher) Stop() {
 	}
 	e.wg.Wait()
 	// Flush the final watermark after the pending events are drained.
-	e.reportWatermark(e.getLastBlock())
+	// Never persist above the current safe head when confirmations are on.
+	candidate := e.getLastBlock()
+	if e.confirmations > 0 {
+		safe := e.safeHead(e.latestHead.Load())
+		if safe < candidate {
+			candidate = safe
+		}
+	}
+	e.reportWatermark(candidate)
 	if client != nil {
 		client.Close()
 	}
@@ -294,7 +354,7 @@ func (e *EVMWatcher) AddWatcher(watcherData WatcherData) error {
 	started := e.started
 	e.mu.Unlock()
 
-	if started {
+	if started && e.confirmations == 0 {
 		e.notifyReload()
 	}
 	return nil
@@ -320,7 +380,7 @@ func (e *EVMWatcher) RemoveWatcher(watcherData WatcherData) error {
 
 	// An empty address list would match every contract on the chain, so keep
 	// the current subscription until a new target is added.
-	if started && remaining > 0 {
+	if started && remaining > 0 && e.confirmations == 0 {
 		e.notifyReload()
 	}
 	return nil
@@ -361,6 +421,7 @@ func (e *EVMWatcher) eventLoop() {
 }
 
 // checkpointLoop reports the node head to the caller periodically.
+// Only used when confirmations == 0; confirmations mode uses confirmationLoop.
 func (e *EVMWatcher) checkpointLoop() {
 	defer e.wg.Done()
 
@@ -386,6 +447,46 @@ func (e *EVMWatcher) checkpointLoop() {
 			e.reportWatermark(head)
 		}
 	}
+}
+
+// confirmationLoop polls the chain head and scans up to safeHead when
+// confirmations > 0. Live subscription is disabled in this mode.
+func (e *EVMWatcher) confirmationLoop() {
+	defer e.wg.Done()
+
+	ctx := e.context()
+	ticker := time.NewTicker(e.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			head, err := e.blockNumber(ctx)
+			if err != nil {
+				e.logf("failed to get block number: %v", err)
+				continue
+			}
+			target := e.safeHead(head)
+			if target == 0 || target <= e.getLastBlock() {
+				continue
+			}
+			if err := e.backfill(ctx, target); err != nil {
+				e.logf("failed to scan confirmed blocks up to %d: %v", target, err)
+			}
+		}
+	}
+}
+
+// safeHead returns head - confirmations. When confirmations is 0 it returns head.
+func (e *EVMWatcher) safeHead(head uint64) uint64 {
+	if e.confirmations == 0 {
+		return head
+	}
+	if head <= e.confirmations {
+		return 0
+	}
+	return head - e.confirmations
 }
 
 // backfill scans from the recorded progress up to head in batches.
@@ -469,7 +570,12 @@ func (e *EVMWatcher) blockNumber(ctx context.Context) (uint64, error) {
 	if err := e.waitRequestSlot(ctx); err != nil {
 		return 0, err
 	}
-	return e.client().BlockNumber(ctx)
+	head, err := e.client().BlockNumber(ctx)
+	if err != nil {
+		return 0, err
+	}
+	e.latestHead.Store(head)
+	return head, nil
 }
 
 // waitRequestSlot serializes the RPC calls and keeps the configured gap between
@@ -545,10 +651,17 @@ func (e *EVMWatcher) notifyLoop() {
 		case event := <-e.eventCh:
 			e.notify(event)
 		case <-ctx.Done():
-			// Deliver the already decoded events before leaving.
+			// Deliver the already decoded events that are still within safeHead.
 			for {
 				select {
 				case event := <-e.eventCh:
+					if e.confirmations > 0 {
+						safe := e.safeHead(e.latestHead.Load())
+						if event.BlockNumber > safe {
+							e.pendingEvents.Add(-1)
+							continue
+						}
+					}
 					e.notify(event)
 				default:
 					return
@@ -559,6 +672,17 @@ func (e *EVMWatcher) notifyLoop() {
 }
 
 func (e *EVMWatcher) notify(event *Event) {
+	if e.confirmations > 0 {
+		safe := e.safeHead(e.latestHead.Load())
+		if event.BlockNumber > safe {
+			// Unconfirmed events must not be delivered; drop and leave watermark.
+			e.pendingEvents.Add(-1)
+			e.logf("drop unconfirmed event %s of %s at block %d (safeHead %d)",
+				event.EventName, event.ContractAddress.Hex(), event.BlockNumber, safe)
+			return
+		}
+	}
+
 	err := e.event.OnEvent(e.chainName, event)
 	e.pendingEvents.Add(-1)
 	if err != nil {
@@ -603,6 +727,16 @@ func (e *EVMWatcher) hasBacklog() bool {
 // remain, only the block before the oldest undelivered one is safe to persist,
 // otherwise a crash would lose the queued events for good.
 func (e *EVMWatcher) reportWatermark(candidate uint64) {
+	if e.confirmations > 0 {
+		safe := e.safeHead(e.latestHead.Load())
+		if safe == 0 {
+			return
+		}
+		if candidate > safe {
+			candidate = safe
+		}
+	}
+
 	if e.hasBacklog() {
 		delivered := e.deliveredBlock.Load()
 		if delivered == 0 {
