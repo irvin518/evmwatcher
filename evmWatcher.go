@@ -3,7 +3,6 @@ package evmwatcher
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/big"
 	"strings"
 	"sync"
@@ -78,6 +77,8 @@ type EVMWatcher struct {
 
 	storage StorageInterface
 	event   EventInterface
+	logger  Logger
+	debug   bool
 
 	mu          sync.RWMutex
 	watcherData []WatcherData
@@ -179,6 +180,9 @@ func NewEVMWatcher(chainName, wssURL string, watcherData []WatcherData, storage 
 	for _, option := range options {
 		option(watcher)
 	}
+	if watcher.logger == nil {
+		watcher.logger = defaultLogger(chainName)
+	}
 	return watcher
 }
 
@@ -260,6 +264,19 @@ func (e *EVMWatcher) Start() error {
 	e.reportMu.Lock()
 	e.reportedBlock = initial
 	e.reportMu.Unlock()
+
+	mode := "subscription"
+	if e.confirmations > 0 {
+		mode = "confirmation"
+	}
+	e.logger.Infof("start watcher: head=%d stored=%d startAt=%d confirmations=%d mode=%s",
+		head, stored, e.getLastBlock(), e.confirmations, mode)
+	for _, target := range targets {
+		for _, ev := range target.events {
+			e.logger.Infof("watch event: contract=%s name=%s topic0=%s",
+				target.address.Hex(), ev.Name, ev.ID.Hex())
+		}
+	}
 
 	if e.confirmations > 0 {
 		// Plan A: no live subscription. Only deliver and advance up to safeHead.
@@ -403,17 +420,21 @@ func (e *EVMWatcher) eventLoop() {
 		case <-ctx.Done():
 			return
 		case vLog := <-e.logCh:
+			if e.debug && len(vLog.Topics) > 0 {
+				e.logger.Debugf("raw log: block=%d tx=%s topic0=%s",
+					vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Topics[0].Hex())
+			}
 			e.dispatch(vLog)
 		case err := <-e.subError():
 			// The blocks missed from now on are unknown, freeze the progress
 			// until the stream is back and the gap is scanned.
 			e.setStreaming(false)
-			e.logf("log subscription broken: %v", err)
+			e.logger.Errorf("log subscription broken: %v", err)
 			e.resubscribe()
 		case <-e.reloadCh:
 			if err := e.subscribe(); err != nil {
 				e.setStreaming(false)
-				e.logf("failed to apply the new watcher list: %v", err)
+				e.logger.Errorf("failed to apply the new watcher list: %v", err)
 				e.resubscribe()
 			}
 		}
@@ -440,11 +461,11 @@ func (e *EVMWatcher) checkpointLoop() {
 			}
 			head, err := e.blockNumber(ctx)
 			if err != nil {
-				e.logf("failed to get block number: %v", err)
+				e.logger.Errorf("failed to get block number: %v", err)
 				continue
 			}
-			e.setLastBlock(head)
-			e.reportWatermark(head)
+			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v",
+				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming())
 		}
 	}
 }
@@ -464,7 +485,7 @@ func (e *EVMWatcher) confirmationLoop() {
 		case <-ticker.C:
 			head, err := e.blockNumber(ctx)
 			if err != nil {
-				e.logf("failed to get block number: %v", err)
+				e.logger.Errorf("failed to get block number: %v", err)
 				continue
 			}
 			target := e.safeHead(head)
@@ -472,7 +493,7 @@ func (e *EVMWatcher) confirmationLoop() {
 				continue
 			}
 			if err := e.backfill(ctx, target); err != nil {
-				e.logf("failed to scan confirmed blocks up to %d: %v", target, err)
+				e.logger.Errorf("failed to scan confirmed blocks up to %d: %v", target, err)
 			}
 		}
 	}
@@ -517,6 +538,7 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 			e.dispatch(vLog)
 		}
 
+		e.logger.Infof("backfill: from=%d to=%d logs=%d scanned_to=%d", from, to, len(logs), scanned)
 		e.setLastBlock(scanned)
 		e.reportWatermark(scanned)
 	}
@@ -542,7 +564,7 @@ func (e *EVMWatcher) filterLogs(ctx context.Context, from, to uint64) ([]types.L
 
 		switch {
 		case isRateLimitError(err):
-			e.logf("rate limited on scanning [%d, %d], retry in %s", from, to, backoff)
+			e.logger.Warnf("rate limited on scanning [%d, %d], retry in %s", from, to, backoff)
 			select {
 			case <-ctx.Done():
 				return nil, 0, ctx.Err()
@@ -556,7 +578,7 @@ func (e *EVMWatcher) filterLogs(ctx context.Context, from, to uint64) ([]types.L
 			span := (to - from + 1) / 2
 			e.setMaxBlockRange(span)
 			to = from + span - 1
-			e.logf("block range rejected, shrink the range to %d blocks", span)
+			e.logger.Warnf("block range rejected, shrink the range to %d blocks", span)
 		case isResultLimitError(err) && to > from:
 			// Only this range is too dense, keep the configured span.
 			to = from + (to-from+1)/2 - 1
@@ -605,18 +627,22 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 	target := e.targets[vLog.Address]
 	e.mu.RUnlock()
 	if target == nil {
+		e.logger.Warnf("drop log: reason=unknown_address address=%s topic0=%s block=%d tx=%s",
+			vLog.Address.Hex(), vLog.Topics[0].Hex(), vLog.BlockNumber, vLog.TxHash.Hex())
 		return
 	}
 	// The node matches addresses and topics independently, which makes the
 	// filter a cartesian product, so check the pair locally again.
 	event, ok := target.events[vLog.Topics[0]]
 	if !ok {
+		e.logger.Warnf("drop log: reason=unknown_topic0 topic0=%s address=%s block=%d tx=%s",
+			vLog.Topics[0].Hex(), vLog.Address.Hex(), vLog.BlockNumber, vLog.TxHash.Hex())
 		return
 	}
 
 	args, err := decodeLog(target.parsed, event, vLog)
 	if err != nil {
-		e.logf("failed to decode event %s of %s: %v", event.Name, vLog.Address.Hex(), err)
+		e.logger.Errorf("failed to decode event %s of %s: %v", event.Name, vLog.Address.Hex(), err)
 		return
 	}
 	// Hand the event over to notifyLoop. Counted before sending so that the
@@ -635,6 +661,8 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		Removed:         vLog.Removed,
 		Raw:             vLog,
 	}:
+		e.logger.Infof("dispatch: event=%s block=%d tx=%s log_index=%d",
+			event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index)
 	case <-e.context().Done():
 		e.pendingEvents.Add(-1)
 	}
@@ -677,7 +705,7 @@ func (e *EVMWatcher) notify(event *Event) {
 		if event.BlockNumber > safe {
 			// Unconfirmed events must not be delivered; drop and leave watermark.
 			e.pendingEvents.Add(-1)
-			e.logf("drop unconfirmed event %s of %s at block %d (safeHead %d)",
+			e.logger.Warnf("drop unconfirmed event %s of %s at block %d (safeHead %d)",
 				event.EventName, event.ContractAddress.Hex(), event.BlockNumber, safe)
 			return
 		}
@@ -688,9 +716,11 @@ func (e *EVMWatcher) notify(event *Event) {
 	if err != nil {
 		// Do not advance the watermark on failure, so a restart can rescan
 		// this block and deliver the event again.
-		e.logf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
+		e.logger.Errorf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
 		return
 	}
+	e.logger.Infof("delivered: event=%s block=%d tx=%s",
+		event.EventName, event.BlockNumber, event.TxHash.Hex())
 	// Persist progress right after a successful delivery, so a restart will not
 	// reprocess the same event.
 	if event.BlockNumber > e.deliveredBlock.Load() {
@@ -755,7 +785,7 @@ func (e *EVMWatcher) reportWatermark(candidate uint64) {
 		return
 	}
 	if err := e.storage.SetWatchedBlockNumber(e.chainName, candidate); err != nil {
-		e.logf("failed to save watched block number %d: %v", candidate, err)
+		e.logger.Errorf("failed to save watched block number %d: %v", candidate, err)
 		return
 	}
 	e.reportedBlock = candidate
@@ -767,6 +797,12 @@ func (e *EVMWatcher) subscribe() error {
 		return fmt.Errorf("no watcher data configured")
 	}
 
+	topicCount := 0
+	if len(query.Topics) > 0 {
+		topicCount = len(query.Topics[0])
+	}
+	e.logger.Infof("filter query: addresses=%d topic0_count=%d", len(query.Addresses), topicCount)
+
 	e.mu.RLock()
 	client, ctx, logCh := e.ethClient, e.ctx, e.logCh
 	e.mu.RUnlock()
@@ -776,6 +812,7 @@ func (e *EVMWatcher) subscribe() error {
 	}
 	sub, err := client.SubscribeFilterLogs(ctx, query, logCh)
 	if err != nil {
+		e.logger.Errorf("subscription failed: %v", err)
 		return fmt.Errorf("failed to subscribe logs: %w", err)
 	}
 
@@ -786,6 +823,7 @@ func (e *EVMWatcher) subscribe() error {
 	if old != nil {
 		old.Unsubscribe()
 	}
+	e.logger.Infof("subscription established")
 	return nil
 }
 
@@ -802,23 +840,23 @@ func (e *EVMWatcher) resubscribe() {
 		}
 
 		if err := e.subscribe(); err != nil {
-			e.logf("failed to resubscribe logs: %v", err)
+			e.logger.Errorf("failed to resubscribe logs: %v", err)
 			continue
 		}
 		head, err := e.blockNumber(ctx)
 		if err != nil {
-			e.logf("failed to get block number: %v", err)
+			e.logger.Errorf("failed to get block number: %v", err)
 			continue
 		}
 		// Subscribe first and scan afterwards, so the blocks produced during
 		// the scan are already buffered in logCh.
 		if err := e.backfill(ctx, head); err != nil {
-			e.logf("failed to scan the missed blocks: %v", err)
+			e.logger.Errorf("failed to scan the missed blocks: %v", err)
 			continue
 		}
 
 		e.setStreaming(true)
-		e.logf("log subscription recovered at block %d", e.getLastBlock())
+		e.logger.Infof("log subscription recovered at block %d", e.getLastBlock())
 		return
 	}
 }
@@ -863,9 +901,10 @@ func (e *EVMWatcher) subError() <-chan error {
 	return e.sub.Err()
 }
 
-// logf prefixes the log with the chain name to tell the watchers apart.
-func (e *EVMWatcher) logf(format string, args ...any) {
-	log.Printf("evmwatcher: ["+e.chainName+"] "+format, args...)
+func (e *EVMWatcher) getReportedBlock() uint64 {
+	e.reportMu.Lock()
+	defer e.reportMu.Unlock()
+	return e.reportedBlock
 }
 
 func (e *EVMWatcher) client() *ethclient.Client {
