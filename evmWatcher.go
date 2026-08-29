@@ -124,6 +124,11 @@ type EVMWatcher struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+
+	// resubscribeMu guards the background resubscribe goroutine so that only
+	// one rebuild runs at a time and eventLoop never blocks on it.
+	resubscribeMu sync.Mutex
+	resubscribing bool
 }
 
 type Option func(*EVMWatcher)
@@ -430,19 +435,20 @@ func (e *EVMWatcher) eventLoop() {
 			// until the stream is back and the gap is scanned.
 			e.setStreaming(false)
 			e.logger.Errorf("log subscription broken: %v", err)
-			e.resubscribe()
+			e.startResubscribe()
 		case <-e.reloadCh:
 			if err := e.subscribe(); err != nil {
 				e.setStreaming(false)
 				e.logger.Errorf("failed to apply the new watcher list: %v", err)
-				e.resubscribe()
+				e.startResubscribe()
 			}
 		}
 	}
 }
 
-// checkpointLoop reports the node head to the caller periodically.
-// Only used when confirmations == 0; confirmations mode uses confirmationLoop.
+// checkpointLoop periodically heals gaps in subscription mode. When the WSS
+// connection is alive but the filter stops pushing logs, eth_getLogs backfill
+// catches up without waiting for sub.Err().
 func (e *EVMWatcher) checkpointLoop() {
 	defer e.wg.Done()
 
@@ -454,8 +460,8 @@ func (e *EVMWatcher) checkpointLoop() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// While the stream is down the covered range is unknown, reporting
-			// the head would skip every missed block for good.
+			// While the stream is down the covered range is unknown, let
+			// resubscribe handle the gap instead.
 			if !e.isStreaming() {
 				continue
 			}
@@ -463,6 +469,12 @@ func (e *EVMWatcher) checkpointLoop() {
 			if err != nil {
 				e.logger.Errorf("failed to get block number: %v", err)
 				continue
+			}
+			cursor := e.getLastBlock()
+			if head > cursor {
+				if err := e.backfill(ctx, head); err != nil {
+					e.logger.Errorf("checkpoint backfill failed: %v", err)
+				}
 			}
 			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v",
 				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming())
@@ -825,6 +837,29 @@ func (e *EVMWatcher) subscribe() error {
 	}
 	e.logger.Infof("subscription established")
 	return nil
+}
+
+// startResubscribe kicks off resubscribe in the background so eventLoop can
+// keep draining logCh while the gap is being scanned.
+func (e *EVMWatcher) startResubscribe() {
+	e.resubscribeMu.Lock()
+	if e.resubscribing {
+		e.resubscribeMu.Unlock()
+		return
+	}
+	e.resubscribing = true
+	e.resubscribeMu.Unlock()
+
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		defer func() {
+			e.resubscribeMu.Lock()
+			e.resubscribing = false
+			e.resubscribeMu.Unlock()
+		}()
+		e.resubscribe()
+	}()
 }
 
 // resubscribe keeps retrying until the subscription is rebuilt and the blocks
