@@ -25,6 +25,7 @@ const (
 	defaultRequestInterval = 200 * time.Millisecond
 	// interval of getting the node head and reporting it through SetWatchedBlockNumber
 	checkpointInterval = 2 * time.Minute
+	heartbeatInterval  = 30 * time.Second
 	logChannelBuffer   = 4096
 	eventChannelBuffer = 4096
 	resubscribeDelay   = 5 * time.Second
@@ -302,17 +303,14 @@ func (e *EVMWatcher) Start() error {
 		return nil
 	}
 
-	// Subscribe before catching up, the pushed logs are buffered in logCh so
-	// that nothing is missed between the scan end and the stream start.
-	if err := e.subscribe(); err != nil {
-		e.release(cancel, client)
-		return err
-	}
-
-	// The node head is ahead of the recorded progress, scan the gap first.
-	if err := e.backfill(ctx, head); err != nil {
-		e.release(cancel, client)
-		return err
+	// Backfill the historical gap before subscribing so that logCh is not
+	// filled while eventLoop is not running yet, and the same logs are not
+	// delivered twice from both FilterLogs and the live stream.
+	if e.getLastBlock() < head {
+		if err := e.backfill(ctx, head); err != nil {
+			e.release(cancel, client)
+			return err
+		}
 	}
 
 	e.mu.Lock()
@@ -320,9 +318,24 @@ func (e *EVMWatcher) Start() error {
 	e.streaming = true
 	e.mu.Unlock()
 
+	// eventLoop must run before subscribe so logCh is drained immediately.
 	e.wg.Add(2)
 	go e.eventLoop()
 	go e.checkpointLoop()
+
+	if err := e.subscribe(); err != nil {
+		e.Stop()
+		return err
+	}
+
+	// Catch up blocks produced during subscribe setup.
+	if head, err := e.blockNumber(ctx); err != nil {
+		e.logger.Errorf("failed to get block number after subscribe: %v", err)
+	} else if e.getLastBlock() < head {
+		if err := e.backfill(ctx, head); err != nil {
+			e.logger.Errorf("failed to catch up after subscribe: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -446,20 +459,23 @@ func (e *EVMWatcher) eventLoop() {
 	}
 }
 
-// checkpointLoop periodically heals gaps in subscription mode. When the WSS
-// connection is alive but the filter stops pushing logs, eth_getLogs backfill
-// catches up without waiting for sub.Err().
+// checkpointLoop keeps the RPC connection alive with periodic BlockNumber
+// calls and heals gaps when the WSS filter stops pushing logs.
 func (e *EVMWatcher) checkpointLoop() {
 	defer e.wg.Done()
 
 	ctx := e.context()
-	ticker := time.NewTicker(checkpointInterval)
-	defer ticker.Stop()
+	heartbeat := time.NewTicker(heartbeatInterval)
+	checkpoint := time.NewTicker(checkpointInterval)
+	defer heartbeat.Stop()
+	defer checkpoint.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-heartbeat.C:
+			e.heartbeat(ctx)
+		case <-checkpoint.C:
 			// While the stream is down the covered range is unknown, let
 			// resubscribe handle the gap instead.
 			if !e.isStreaming() {
@@ -501,14 +517,35 @@ func (e *EVMWatcher) confirmationLoop() {
 				continue
 			}
 			target := e.safeHead(head)
-			if target == 0 || target <= e.getLastBlock() {
-				continue
-			}
-			if err := e.backfill(ctx, target); err != nil {
-				e.logger.Errorf("failed to scan confirmed blocks up to %d: %v", target, err)
+			if target > e.getLastBlock() {
+				if err := e.backfill(ctx, target); err != nil {
+					e.logger.Errorf("failed to scan confirmed blocks up to %d: %v", target, err)
+				}
+			} else {
+				e.heartbeatAt(ctx, head)
 			}
 		}
 	}
+}
+
+// heartbeat persists the current scan progress and logs the chain head.
+func (e *EVMWatcher) heartbeat(ctx context.Context) {
+	e.heartbeatAt(ctx, 0)
+}
+
+func (e *EVMWatcher) heartbeatAt(ctx context.Context, head uint64) {
+	if head == 0 {
+		var err error
+		head, err = e.blockNumber(ctx)
+		if err != nil {
+			e.logger.Errorf("heartbeat failed: %v", err)
+			return
+		}
+	}
+	cursor := e.getLastBlock()
+	e.reportWatermark(cursor)
+	e.logger.Infof("heartbeat: head=%d lastBlock=%d delivered=%d reported=%d",
+		head, cursor, e.deliveredBlock.Load(), e.getReportedBlock())
 }
 
 // safeHead returns head - confirmations. When confirmations is 0 it returns head.
@@ -657,11 +694,9 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		e.logger.Errorf("failed to decode event %s of %s: %v", event.Name, vLog.Address.Hex(), err)
 		return
 	}
-	// Hand the event over to notifyLoop. Counted before sending so that the
-	// event is part of the backlog even while the send blocks.
-	e.pendingEvents.Add(1)
-	select {
-	case e.eventCh <- &Event{
+	// Hand the event over to notifyLoop. Wait with backpressure when the
+	// channel is full instead of blocking forever without yielding.
+	ev := &Event{
 		ContractAddress: vLog.Address,
 		EventName:       event.Name,
 		BlockNumber:     vLog.BlockNumber,
@@ -672,11 +707,30 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		Args:            args,
 		Removed:         vLog.Removed,
 		Raw:             vLog,
-	}:
-		e.logger.Infof("dispatch: event=%s block=%d tx=%s log_index=%d",
-			event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index)
-	case <-e.context().Done():
-		e.pendingEvents.Add(-1)
+	}
+	for {
+		e.pendingEvents.Add(1)
+		select {
+		case e.eventCh <- ev:
+			e.logger.Infof("dispatch: event=%s block=%d tx=%s log_index=%d",
+				event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index)
+			return
+		case <-e.context().Done():
+			e.pendingEvents.Add(-1)
+			return
+		default:
+			e.pendingEvents.Add(-1)
+		}
+		select {
+		case e.eventCh <- ev:
+			e.pendingEvents.Add(1)
+			e.logger.Infof("dispatch: event=%s block=%d tx=%s log_index=%d",
+				event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index)
+			return
+		case <-e.context().Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
@@ -874,20 +928,31 @@ func (e *EVMWatcher) resubscribe() {
 		case <-time.After(resubscribeDelay):
 		}
 
-		if err := e.subscribe(); err != nil {
-			e.logger.Errorf("failed to resubscribe logs: %v", err)
-			continue
-		}
 		head, err := e.blockNumber(ctx)
 		if err != nil {
 			e.logger.Errorf("failed to get block number: %v", err)
 			continue
 		}
-		// Subscribe first and scan afterwards, so the blocks produced during
-		// the scan are already buffered in logCh.
-		if err := e.backfill(ctx, head); err != nil {
-			e.logger.Errorf("failed to scan the missed blocks: %v", err)
+		// Scan the gap before subscribing so the same logs are not delivered
+		// twice from both FilterLogs and the live stream.
+		if e.getLastBlock() < head {
+			if err := e.backfill(ctx, head); err != nil {
+				e.logger.Errorf("failed to scan the missed blocks: %v", err)
+				continue
+			}
+		}
+		if err := e.subscribe(); err != nil {
+			e.logger.Errorf("failed to resubscribe logs: %v", err)
 			continue
+		}
+		// Catch up blocks produced during subscribe setup.
+		if head, err := e.blockNumber(ctx); err != nil {
+			e.logger.Errorf("failed to get block number after resubscribe: %v", err)
+		} else if e.getLastBlock() < head {
+			if err := e.backfill(ctx, head); err != nil {
+				e.logger.Errorf("failed to catch up after resubscribe: %v", err)
+				continue
+			}
 		}
 
 		e.setStreaming(true)
