@@ -2,6 +2,7 @@ package evmwatcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -35,6 +36,8 @@ const (
 	rateLimitBackoff       = time.Second
 	maxRateLimitBackoff    = 30 * time.Second
 	defaultPollInterval    = 3 * time.Second
+	largeGapThreshold      = uint64(1000)
+	filterLogsTimeout      = 30 * time.Second
 )
 
 // WatcherData describes one contract and the events watched on it.
@@ -130,6 +133,9 @@ type EVMWatcher struct {
 	// one rebuild runs at a time and eventLoop never blocks on it.
 	resubscribeMu sync.Mutex
 	resubscribing bool
+	// backfillMu serializes concurrent backfill callers (startup goroutine,
+	// checkpointLoop, confirmationLoop, resubscribe).
+	backfillMu sync.Mutex
 }
 
 type Option func(*EVMWatcher)
@@ -277,6 +283,12 @@ func (e *EVMWatcher) Start() error {
 	}
 	e.logger.Infof("start watcher: head=%d stored=%d startAt=%d confirmations=%d mode=%s",
 		head, stored, e.getLastBlock(), e.confirmations, mode)
+	if stored >= 0 {
+		gap := head - uint64(stored)
+		if gap > largeGapThreshold {
+			e.logger.Warnf("large block gap: head=%d stored=%d gap=%d", head, stored, gap)
+		}
+	}
 	for _, target := range targets {
 		for _, ev := range target.events {
 			e.logger.Infof("watch event: contract=%s name=%s topic0=%s",
@@ -285,14 +297,6 @@ func (e *EVMWatcher) Start() error {
 	}
 
 	if e.confirmations > 0 {
-		// Plan A: no live subscription. Only deliver and advance up to safeHead.
-		if startAt > 0 && e.getLastBlock() < startAt {
-			if err := e.backfill(ctx, startAt); err != nil {
-				e.release(cancel, client)
-				return err
-			}
-		}
-
 		e.mu.Lock()
 		e.started = true
 		e.streaming = true
@@ -300,17 +304,11 @@ func (e *EVMWatcher) Start() error {
 
 		e.wg.Add(1)
 		go e.confirmationLoop()
-		return nil
-	}
 
-	// Backfill the historical gap before subscribing so that logCh is not
-	// filled while eventLoop is not running yet, and the same logs are not
-	// delivered twice from both FilterLogs and the live stream.
-	if e.getLastBlock() < head {
-		if err := e.backfill(ctx, head); err != nil {
-			e.release(cancel, client)
-			return err
+		if startAt > 0 && e.getLastBlock() < startAt {
+			e.startBackfill(startAt)
 		}
+		return nil
 	}
 
 	e.mu.Lock()
@@ -328,13 +326,8 @@ func (e *EVMWatcher) Start() error {
 		return err
 	}
 
-	// Catch up blocks produced during subscribe setup.
-	if head, err := e.blockNumber(ctx); err != nil {
-		e.logger.Errorf("failed to get block number after subscribe: %v", err)
-	} else if e.getLastBlock() < head {
-		if err := e.backfill(ctx, head); err != nil {
-			e.logger.Errorf("failed to catch up after subscribe: %v", err)
-		}
+	if e.getLastBlock() < head {
+		e.startBackfill(head)
 	}
 	return nil
 }
@@ -559,8 +552,23 @@ func (e *EVMWatcher) safeHead(head uint64) uint64 {
 	return head - e.confirmations
 }
 
+// startBackfill runs backfill in the background so Start() is not blocked.
+func (e *EVMWatcher) startBackfill(head uint64) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		ctx := e.context()
+		if err := e.backfill(ctx, head); err != nil && ctx.Err() == nil {
+			e.logger.Errorf("backfill failed up to %d: %v", head, err)
+		}
+	}()
+}
+
 // backfill scans from the recorded progress up to head in batches.
 func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
+	e.backfillMu.Lock()
+	defer e.backfillMu.Unlock()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -577,6 +585,8 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 			to = head
 		}
 
+		e.logger.Infof("backfill batch start: from=%d to=%d target_head=%d", from, to, head)
+
 		// The scanned range may be narrower than the requested one when the
 		// provider rejects it.
 		logs, scanned, err := e.filterLogs(ctx, from, to)
@@ -587,7 +597,7 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 			e.dispatch(vLog)
 		}
 
-		e.logger.Infof("backfill: from=%d to=%d logs=%d scanned_to=%d", from, to, len(logs), scanned)
+		e.logger.Infof("backfill batch done: from=%d to=%d logs=%d scanned_to=%d", from, to, len(logs), scanned)
 		e.setLastBlock(scanned)
 		e.reportWatermark(scanned)
 	}
@@ -606,12 +616,24 @@ func (e *EVMWatcher) filterLogs(ctx context.Context, from, to uint64) ([]types.L
 		if err := e.waitRequestSlot(ctx); err != nil {
 			return nil, 0, err
 		}
-		logs, err := e.client().FilterLogs(ctx, query)
+		rpcCtx, cancel := context.WithTimeout(ctx, filterLogsTimeout)
+		logs, err := e.client().FilterLogs(rpcCtx, query)
+		cancel()
 		if err == nil {
 			return logs, to, nil
 		}
 
 		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			e.logger.Warnf("filterLogs timed out on [%d, %d] after %s, retry in %s", from, to, filterLogsTimeout, backoff)
+			select {
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff < maxRateLimitBackoff {
+				backoff *= 2
+			}
 		case isRateLimitError(err):
 			e.logger.Warnf("rate limited on scanning [%d, %d], retry in %s", from, to, backoff)
 			select {
