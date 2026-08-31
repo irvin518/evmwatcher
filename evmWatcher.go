@@ -133,7 +133,7 @@ type EVMWatcher struct {
 	resubscribeMu sync.Mutex
 	resubscribing bool
 	// backfillMu serializes concurrent backfill callers (startup goroutine,
-	// checkpointLoop, confirmationLoop, resubscribe).
+	// checkpointLoop, confirmationLoop, resubscribe, gap heal).
 	backfillMu sync.Mutex
 
 	// skipGapThreshold skips historical catch-up when head-stored exceeds this
@@ -145,6 +145,7 @@ type EVMWatcher struct {
 	// before live WSS delivery is enabled. 0 means catch-up is complete.
 	catchUpTarget atomic.Uint64
 	catchingUp    atomic.Bool
+	gapHealRunning atomic.Bool
 
 	// pendingConfirm holds decoded events waiting for N-block confirmation.
 	confirmMu        sync.Mutex
@@ -494,6 +495,9 @@ func (e *EVMWatcher) checkpointLoop() {
 				e.logger.Errorf("failed to get block number: %v", err)
 				continue
 			}
+			if e.confirmations == 0 {
+				e.maybeGapHeal(ctx, head)
+			}
 			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v catching_up=%v",
 				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming(), e.catchingUp.Load())
 		}
@@ -541,17 +545,21 @@ func (e *EVMWatcher) heartbeatAt(ctx context.Context, head uint64) {
 			head, safe, e.getLastBlock(), e.pendingConfirmCount(), e.getReportedBlock())
 		return
 	}
-	// Live mode (confirmations=0): sync watermark to chain head when idle.
+	// Live mode (confirmations=0): never push watermark past delivered without
+	// a FilterLogs scan; heal gaps when chain head runs ahead of delivery.
 	if e.hasBacklog() {
-		e.logger.Infof("heartbeat: backlog pending head=%d lastBlock=%d reported=%d",
-			head, e.getLastBlock(), e.getReportedBlock())
+		e.logger.Infof("heartbeat: backlog pending head=%d lastBlock=%d delivered=%d reported=%d",
+			head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock())
 		return
 	}
-	if head > e.getLastBlock() {
-		e.setLastBlock(head)
+	delivered := e.deliveredBlock.Load()
+	if head > delivered {
+		e.maybeGapHeal(ctx, head)
+		return
 	}
-	e.reportWatermark(e.getLastBlock())
-	e.logger.Infof("heartbeat: head=%d watermark=%d", head, e.getLastBlock())
+	e.reportWatermark(delivered)
+	e.logger.Infof("heartbeat: head=%d delivered=%d reported=%d",
+		head, delivered, e.getReportedBlock())
 }
 
 // safeHead returns head - confirmations. When confirmations is 0 it returns head.
@@ -639,18 +647,20 @@ func (e *EVMWatcher) endCatchUp() {
 				e.reportWatermark(safe)
 			}
 		} else if head > 0 {
-			if head > e.getLastBlock() {
-				e.setLastBlock(head)
+			delivered := e.deliveredBlock.Load()
+			wm := e.getLastBlock()
+			if delivered > wm {
+				wm = delivered
 			}
-			e.reportWatermark(e.getLastBlock())
+			e.reportWatermark(wm)
 		}
 	}
-	e.logger.Infof("catch-up complete: lastBlock=%d", e.getLastBlock())
+	e.logger.Infof("catch-up complete: lastBlock=%d delivered=%d",
+		e.getLastBlock(), e.deliveredBlock.Load())
 }
 
-// effectiveBackfillHead caps the scan target for one backfill run.
-func (e *EVMWatcher) effectiveBackfillHead(head uint64) uint64 {
-	from := e.getLastBlock() + 1
+// effectiveBackfillHeadFrom caps the scan target for one backfill run starting at from.
+func (e *EVMWatcher) effectiveBackfillHeadFrom(from, head uint64) uint64 {
 	if from > head {
 		return head
 	}
@@ -662,6 +672,42 @@ func (e *EVMWatcher) effectiveBackfillHead(head uint64) uint64 {
 		return head
 	}
 	return maxTo
+}
+
+// effectiveBackfillHead caps the scan target for one backfill run.
+func (e *EVMWatcher) effectiveBackfillHead(head uint64) uint64 {
+	return e.effectiveBackfillHeadFrom(e.getLastBlock()+1, head)
+}
+
+// maybeGapHeal scans [delivered+1, head] when WSS may have missed logs.
+// Safe to call from heartbeat/checkpoint; backfillMu serializes work.
+func (e *EVMWatcher) maybeGapHeal(ctx context.Context, head uint64) {
+	if e.confirmations > 0 || e.catchingUp.Load() || !e.isStreaming() {
+		return
+	}
+	delivered := e.deliveredBlock.Load()
+	if head <= delivered {
+		return
+	}
+	// Continue from the scan cursor when empty ranges were already verified;
+	// fall back to delivered+1 when lastBlock has not moved past delivery.
+	from := e.getLastBlock() + 1
+	if from <= delivered {
+		from = delivered + 1
+	}
+	e.logger.Infof("gap heal: delivered=%d head=%d lastBlock=%d scan=[%d,%d]",
+		delivered, head, e.getLastBlock(), from, e.effectiveBackfillHeadFrom(from, head))
+	if !e.gapHealRunning.CompareAndSwap(false, true) {
+		return
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		defer e.gapHealRunning.Store(false)
+		if err := e.backfillFrom(ctx, from, head); err != nil && ctx.Err() == nil {
+			e.logger.Errorf("gap heal failed [%d,%d]: %v", from, head, err)
+		}
+	}()
 }
 
 // startBackfill runs catch-up backfill in the background until the target head
@@ -743,10 +789,22 @@ func (e *EVMWatcher) runCatchUp(ctx context.Context, target uint64) error {
 
 // backfill scans from the recorded progress up to head in batches.
 func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
+	return e.backfillFrom(ctx, e.getLastBlock()+1, head)
+}
+
+// backfillFrom scans [from, head] in batches. The scan cursor is tracked locally
+// so a gap heal can rescan from delivered+1 even when lastBlock was advanced
+// incorrectly.
+func (e *EVMWatcher) backfillFrom(ctx context.Context, from, head uint64) error {
 	e.backfillMu.Lock()
 	defer e.backfillMu.Unlock()
 
-	target := e.effectiveBackfillHead(head)
+	if from > head {
+		return nil
+	}
+
+	cursor := from - 1
+	target := e.effectiveBackfillHeadFrom(from, head)
 	for {
 		select {
 		case <-ctx.Done():
@@ -754,24 +812,22 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 		default:
 		}
 
-		from := e.getLastBlock() + 1
-		if from > target {
+		nextFrom := cursor + 1
+		if nextFrom > target {
 			if target < head {
 				e.logger.Infof("backfill partial: scanned_to=%d chain_head=%d max_catch_up=%d",
-					e.getLastBlock(), head, e.maxCatchUpBlocks)
+					cursor, head, e.maxCatchUpBlocks)
 			}
 			return nil
 		}
-		to := from + e.getMaxBlockRange() - 1
+		to := nextFrom + e.getMaxBlockRange() - 1
 		if to > target {
 			to = target
 		}
 
-		e.logger.Infof("backfill batch start: from=%d to=%d target_head=%d", from, to, target)
+		e.logger.Infof("backfill batch start: from=%d to=%d target_head=%d", nextFrom, to, target)
 
-		// The scanned range may be narrower than the requested one when the
-		// provider rejects it.
-		logs, scanned, err := e.filterLogs(ctx, from, to)
+		logs, scanned, err := e.filterLogs(ctx, nextFrom, to)
 		if err != nil {
 			return err
 		}
@@ -779,11 +835,12 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 			e.dispatch(vLog)
 		}
 
-		e.logger.Infof("backfill batch done: from=%d to=%d logs=%d scanned_to=%d", from, to, len(logs), scanned)
-		e.setLastBlock(scanned)
-		if e.confirmations > 0 {
-			e.reportWatermark(scanned)
+		e.logger.Infof("backfill batch done: from=%d to=%d logs=%d scanned_to=%d", nextFrom, to, len(logs), scanned)
+		cursor = scanned
+		if scanned > e.getLastBlock() {
+			e.setLastBlock(scanned)
 		}
+		e.reportScannedWatermark(scanned)
 	}
 }
 
@@ -1069,6 +1126,17 @@ func (e *EVMWatcher) hasBacklog() bool {
 	return e.pendingEvents.Load() > 0 || len(e.logCh) > 0
 }
 
+// reportScannedWatermark persists progress after a FilterLogs scan.
+func (e *EVMWatcher) reportScannedWatermark(scanned uint64) {
+	if e.confirmations > 0 {
+		e.reportWatermark(scanned)
+		return
+	}
+	// In live mode only advance reported up to scanned blocks; delivery may lag
+	// within the scanned range but never skip unscanned blocks.
+	e.reportWatermark(scanned)
+}
+
 // reportWatermark persists the progress through SetWatchedBlockNumber. candidate
 // is the block the scan or the stream has reached; while undelivered events
 // remain, only the block before the oldest undelivered one is safe to persist,
@@ -1081,6 +1149,14 @@ func (e *EVMWatcher) reportWatermark(candidate uint64) {
 		}
 		if candidate > safe {
 			candidate = safe
+		}
+	}
+
+	if e.confirmations == 0 {
+		// Never persist beyond the scan cursor without an actual FilterLogs pass.
+		scanned := e.getLastBlock()
+		if candidate > scanned {
+			candidate = scanned
 		}
 	}
 
