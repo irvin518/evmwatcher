@@ -36,7 +36,6 @@ const (
 	rateLimitBackoff       = time.Second
 	maxRateLimitBackoff    = 30 * time.Second
 	defaultPollInterval    = 3 * time.Second
-	largeGapThreshold      = uint64(1000)
 	filterLogsTimeout      = 30 * time.Second
 )
 
@@ -136,6 +135,15 @@ type EVMWatcher struct {
 	// backfillMu serializes concurrent backfill callers (startup goroutine,
 	// checkpointLoop, confirmationLoop, resubscribe).
 	backfillMu sync.Mutex
+
+	// skipGapThreshold skips historical catch-up when head-stored exceeds this
+	// value (0 disables). maxCatchUpBlocks caps how many blocks one backfill
+	// run may scan (0 = unlimited).
+	skipGapThreshold uint64
+	maxCatchUpBlocks uint64
+	// gapFillTarget is the chain head that must be reached by backfill before
+	// the WSS stream may deliver logs ahead of lastBlock. 0 means no active gap.
+	gapFillTarget atomic.Uint64
 }
 
 type Option func(*EVMWatcher)
@@ -173,6 +181,22 @@ func WithPollInterval(d time.Duration) Option {
 		if d > 0 {
 			e.pollInterval = d
 		}
+	}
+}
+
+// WithSkipGapThreshold skips historical catch-up when head-stored exceeds this
+// value and jumps the cursor to the current (safe) head. 0 disables skipping.
+func WithSkipGapThreshold(blocks uint64) Option {
+	return func(e *EVMWatcher) {
+		e.skipGapThreshold = blocks
+	}
+}
+
+// WithMaxCatchUpBlocks limits how many blocks a single backfill run may scan.
+// 0 means unlimited.
+func WithMaxCatchUpBlocks(blocks uint64) Option {
+	return func(e *EVMWatcher) {
+		e.maxCatchUpBlocks = blocks
 	}
 }
 
@@ -281,14 +305,9 @@ func (e *EVMWatcher) Start() error {
 	if e.confirmations > 0 {
 		mode = "confirmation"
 	}
-	e.logger.Infof("start watcher: head=%d stored=%d startAt=%d confirmations=%d mode=%s",
-		head, stored, e.getLastBlock(), e.confirmations, mode)
-	if stored >= 0 {
-		gap := head - uint64(stored)
-		if gap > largeGapThreshold {
-			e.logger.Warnf("large block gap: head=%d stored=%d gap=%d", head, stored, gap)
-		}
-	}
+	e.logger.Infof("start watcher: head=%d stored=%d startAt=%d confirmations=%d mode=%s skip_gap=%d max_catch_up=%d",
+		head, stored, e.getLastBlock(), e.confirmations, mode, e.skipGapThreshold, e.maxCatchUpBlocks)
+	e.applyGapStrategy(head, stored)
 	for _, target := range targets {
 		for _, ev := range target.events {
 			e.logger.Infof("watch event: contract=%s name=%s topic0=%s",
@@ -306,6 +325,7 @@ func (e *EVMWatcher) Start() error {
 		go e.confirmationLoop()
 
 		if startAt > 0 && e.getLastBlock() < startAt {
+			e.beginGapFill(startAt)
 			e.startBackfill(startAt)
 		}
 		return nil
@@ -313,7 +333,6 @@ func (e *EVMWatcher) Start() error {
 
 	e.mu.Lock()
 	e.started = true
-	e.streaming = true
 	e.mu.Unlock()
 
 	// eventLoop must run before subscribe so logCh is drained immediately.
@@ -327,7 +346,10 @@ func (e *EVMWatcher) Start() error {
 	}
 
 	if e.getLastBlock() < head {
+		e.beginGapFill(head)
 		e.startBackfill(head)
+	} else {
+		e.setStreaming(true)
 	}
 	return nil
 }
@@ -431,6 +453,11 @@ func (e *EVMWatcher) eventLoop() {
 		case <-ctx.Done():
 			return
 		case vLog := <-e.logCh:
+			if e.shouldBlockStreamLog(vLog.BlockNumber) {
+				e.logger.Warnf("drop log: reason=gap_not_filled block=%d lastBlock=%d gap_target=%d",
+					vLog.BlockNumber, e.getLastBlock(), e.getGapFillTarget())
+				continue
+			}
 			if e.debug && len(vLog.Topics) > 0 {
 				e.logger.Debugf("raw log: block=%d tx=%s topic0=%s",
 					vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Topics[0].Hex())
@@ -481,9 +508,8 @@ func (e *EVMWatcher) checkpointLoop() {
 			}
 			cursor := e.getLastBlock()
 			if head > cursor {
-				if err := e.backfill(ctx, head); err != nil {
-					e.logger.Errorf("checkpoint backfill failed: %v", err)
-				}
+				e.beginGapFill(head)
+				e.startBackfill(head)
 			}
 			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v",
 				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming())
@@ -511,6 +537,7 @@ func (e *EVMWatcher) confirmationLoop() {
 			}
 			target := e.safeHead(head)
 			if target > e.getLastBlock() {
+				e.beginGapFill(target)
 				if err := e.backfill(ctx, target); err != nil {
 					e.logger.Errorf("failed to scan confirmed blocks up to %d: %v", target, err)
 				}
@@ -552,6 +579,90 @@ func (e *EVMWatcher) safeHead(head uint64) uint64 {
 	return head - e.confirmations
 }
 
+// applyGapStrategy jumps over historical blocks when the stored gap exceeds
+// skipGapThreshold.
+func (e *EVMWatcher) applyGapStrategy(head uint64, stored int64) {
+	if stored < 0 || e.skipGapThreshold == 0 {
+		return
+	}
+	gap := head - uint64(stored)
+	if gap <= e.skipGapThreshold {
+		return
+	}
+	skipTo := head
+	if e.confirmations > 0 {
+		skipTo = e.safeHead(head)
+	}
+	e.logger.Warnf("skip gap: stored=%d head=%d gap=%d threshold=%d skip_to=%d",
+		stored, head, gap, e.skipGapThreshold, skipTo)
+	e.setLastBlock(skipTo)
+	e.deliveredBlock.Store(skipTo)
+	e.reportMu.Lock()
+	e.reportedBlock = skipTo
+	e.reportMu.Unlock()
+	e.reportWatermark(skipTo)
+}
+
+// beginGapFill marks a catch-up in progress and blocks the WSS stream from
+// delivering logs ahead of the backfill cursor.
+func (e *EVMWatcher) beginGapFill(head uint64) {
+	if head == 0 {
+		return
+	}
+	for {
+		current := e.getGapFillTarget()
+		if current >= head {
+			break
+		}
+		if e.gapFillTarget.CompareAndSwap(current, head) {
+			break
+		}
+	}
+	e.setStreaming(false)
+}
+
+func (e *EVMWatcher) getGapFillTarget() uint64 {
+	return e.gapFillTarget.Load()
+}
+
+func (e *EVMWatcher) shouldBlockStreamLog(blockNum uint64) bool {
+	target := e.getGapFillTarget()
+	if target == 0 {
+		return false
+	}
+	last := e.getLastBlock()
+	if last >= target {
+		return false
+	}
+	return blockNum > last
+}
+
+func (e *EVMWatcher) maybeClearGapFill() {
+	target := e.getGapFillTarget()
+	if target == 0 || e.getLastBlock() < target {
+		return
+	}
+	e.gapFillTarget.Store(0)
+	e.setStreaming(true)
+	e.logger.Infof("gap fill complete at block %d", e.getLastBlock())
+}
+
+// effectiveBackfillHead caps the scan target for one backfill run.
+func (e *EVMWatcher) effectiveBackfillHead(head uint64) uint64 {
+	from := e.getLastBlock() + 1
+	if from > head {
+		return head
+	}
+	if e.maxCatchUpBlocks == 0 {
+		return head
+	}
+	maxTo := from + e.maxCatchUpBlocks - 1
+	if maxTo > head {
+		return head
+	}
+	return maxTo
+}
+
 // startBackfill runs backfill in the background so Start() is not blocked.
 func (e *EVMWatcher) startBackfill(head uint64) {
 	e.wg.Add(1)
@@ -569,6 +680,7 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 	e.backfillMu.Lock()
 	defer e.backfillMu.Unlock()
 
+	target := e.effectiveBackfillHead(head)
 	for {
 		select {
 		case <-ctx.Done():
@@ -577,15 +689,20 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 		}
 
 		from := e.getLastBlock() + 1
-		if from > head {
+		if from > target {
+			if target < head {
+				e.logger.Infof("backfill partial: scanned_to=%d chain_head=%d max_catch_up=%d",
+					e.getLastBlock(), head, e.maxCatchUpBlocks)
+			}
+			e.maybeClearGapFill()
 			return nil
 		}
 		to := from + e.getMaxBlockRange() - 1
-		if to > head {
-			to = head
+		if to > target {
+			to = target
 		}
 
-		e.logger.Infof("backfill batch start: from=%d to=%d target_head=%d", from, to, head)
+		e.logger.Infof("backfill batch start: from=%d to=%d target_head=%d", from, to, target)
 
 		// The scanned range may be narrower than the requested one when the
 		// provider rejects it.
@@ -624,16 +741,15 @@ func (e *EVMWatcher) filterLogs(ctx context.Context, from, to uint64) ([]types.L
 		}
 
 		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			e.logger.Warnf("filterLogs timed out on [%d, %d] after %s, retry in %s", from, to, filterLogsTimeout, backoff)
-			select {
-			case <-ctx.Done():
-				return nil, 0, ctx.Err()
-			case <-time.After(backoff):
+		case errors.Is(err, context.DeadlineExceeded) && to > from:
+			origTo := to
+			span := (origTo - from + 1) / 2
+			if span == 0 {
+				span = 1
 			}
-			if backoff < maxRateLimitBackoff {
-				backoff *= 2
-			}
+			e.setMaxBlockRange(span)
+			to = from + span - 1
+			e.logger.Warnf("filterLogs timed out on [%d, %d], shrink range to %d blocks", from, origTo, span)
 		case isRateLimitError(err):
 			e.logger.Warnf("rate limited on scanning [%d, %d], retry in %s", from, to, backoff)
 			select {
@@ -955,9 +1071,8 @@ func (e *EVMWatcher) resubscribe() {
 			e.logger.Errorf("failed to get block number: %v", err)
 			continue
 		}
-		// Scan the gap before subscribing so the same logs are not delivered
-		// twice from both FilterLogs and the live stream.
 		if e.getLastBlock() < head {
+			e.beginGapFill(head)
 			if err := e.backfill(ctx, head); err != nil {
 				e.logger.Errorf("failed to scan the missed blocks: %v", err)
 				continue
@@ -967,18 +1082,22 @@ func (e *EVMWatcher) resubscribe() {
 			e.logger.Errorf("failed to resubscribe logs: %v", err)
 			continue
 		}
-		// Catch up blocks produced during subscribe setup.
 		if head, err := e.blockNumber(ctx); err != nil {
 			e.logger.Errorf("failed to get block number after resubscribe: %v", err)
 		} else if e.getLastBlock() < head {
+			e.beginGapFill(head)
 			if err := e.backfill(ctx, head); err != nil {
 				e.logger.Errorf("failed to catch up after resubscribe: %v", err)
 				continue
 			}
 		}
 
-		e.setStreaming(true)
-		e.logger.Infof("log subscription recovered at block %d", e.getLastBlock())
+		e.maybeClearGapFill()
+		if !e.isStreaming() && e.getGapFillTarget() > 0 {
+			e.startBackfill(e.getGapFillTarget())
+		}
+		e.logger.Infof("log subscription recovered at block %d streaming=%v gap_target=%d",
+			e.getLastBlock(), e.isStreaming(), e.getGapFillTarget())
 		return
 	}
 }
