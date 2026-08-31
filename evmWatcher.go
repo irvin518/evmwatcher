@@ -141,9 +141,14 @@ type EVMWatcher struct {
 	// run may scan (0 = unlimited).
 	skipGapThreshold uint64
 	maxCatchUpBlocks uint64
-	// gapFillTarget is the chain head that must be reached by backfill before
-	// the WSS stream may deliver logs ahead of lastBlock. 0 means no active gap.
-	gapFillTarget atomic.Uint64
+	// catchUpTarget is the chain head startup/resubscribe backfill must reach
+	// before live WSS delivery is enabled. 0 means catch-up is complete.
+	catchUpTarget atomic.Uint64
+	catchingUp    atomic.Bool
+
+	// pendingConfirm holds decoded events waiting for N-block confirmation.
+	confirmMu        sync.Mutex
+	pendingConfirm   []*Event
 }
 
 type Option func(*EVMWatcher)
@@ -303,7 +308,7 @@ func (e *EVMWatcher) Start() error {
 
 	mode := "subscription"
 	if e.confirmations > 0 {
-		mode = "confirmation"
+		mode = "subscription+confirm"
 	}
 	e.logger.Infof("start watcher: head=%d stored=%d startAt=%d confirmations=%d mode=%s skip_gap=%d max_catch_up=%d",
 		head, stored, e.getLastBlock(), e.confirmations, mode, e.skipGapThreshold, e.maxCatchUpBlocks)
@@ -315,27 +320,10 @@ func (e *EVMWatcher) Start() error {
 		}
 	}
 
-	if e.confirmations > 0 {
-		e.mu.Lock()
-		e.started = true
-		e.streaming = true
-		e.mu.Unlock()
-
-		e.wg.Add(1)
-		go e.confirmationLoop()
-
-		if startAt > 0 && e.getLastBlock() < startAt {
-			e.beginGapFill(startAt)
-			e.startBackfill(startAt)
-		}
-		return nil
-	}
-
 	e.mu.Lock()
 	e.started = true
 	e.mu.Unlock()
 
-	// eventLoop must run before subscribe so logCh is drained immediately.
 	e.wg.Add(2)
 	go e.eventLoop()
 	go e.checkpointLoop()
@@ -345,9 +333,10 @@ func (e *EVMWatcher) Start() error {
 		return err
 	}
 
-	if e.getLastBlock() < head {
-		e.beginGapFill(head)
-		e.startBackfill(head)
+	catchTarget := e.catchUpHead(head)
+	if catchTarget > 0 && e.getLastBlock() < catchTarget {
+		e.beginCatchUp(catchTarget)
+		e.startBackfill(catchTarget)
 	} else {
 		e.setStreaming(true)
 	}
@@ -404,7 +393,7 @@ func (e *EVMWatcher) AddWatcher(watcherData WatcherData) error {
 	started := e.started
 	e.mu.Unlock()
 
-	if started && e.confirmations == 0 {
+	if started {
 		e.notifyReload()
 	}
 	return nil
@@ -430,7 +419,7 @@ func (e *EVMWatcher) RemoveWatcher(watcherData WatcherData) error {
 
 	// An empty address list would match every contract on the chain, so keep
 	// the current subscription until a new target is added.
-	if started && remaining > 0 && e.confirmations == 0 {
+	if started && remaining > 0 {
 		e.notifyReload()
 	}
 	return nil
@@ -454,8 +443,8 @@ func (e *EVMWatcher) eventLoop() {
 			return
 		case vLog := <-e.logCh:
 			if e.shouldBlockStreamLog(vLog.BlockNumber) {
-				e.logger.Warnf("drop log: reason=gap_not_filled block=%d lastBlock=%d gap_target=%d",
-					vLog.BlockNumber, e.getLastBlock(), e.getGapFillTarget())
+				e.logger.Warnf("drop log: reason=catch_up_pending block=%d lastBlock=%d catch_up_target=%d",
+					vLog.BlockNumber, e.getLastBlock(), e.getCatchUpTarget())
 				continue
 			}
 			if e.debug && len(vLog.Topics) > 0 {
@@ -485,7 +474,11 @@ func (e *EVMWatcher) checkpointLoop() {
 	defer e.wg.Done()
 
 	ctx := e.context()
-	heartbeat := time.NewTicker(heartbeatInterval)
+	hbInterval := heartbeatInterval
+	if e.confirmations > 0 {
+		hbInterval = e.pollInterval
+	}
+	heartbeat := time.NewTicker(hbInterval)
 	checkpoint := time.NewTicker(checkpointInterval)
 	defer heartbeat.Stop()
 	defer checkpoint.Stop()
@@ -496,56 +489,24 @@ func (e *EVMWatcher) checkpointLoop() {
 		case <-heartbeat.C:
 			e.heartbeat(ctx)
 		case <-checkpoint.C:
-			// While the stream is down the covered range is unknown, let
-			// resubscribe handle the gap instead.
-			if !e.isStreaming() {
-				continue
-			}
 			head, err := e.blockNumber(ctx)
 			if err != nil {
 				e.logger.Errorf("failed to get block number: %v", err)
 				continue
 			}
-			cursor := e.getLastBlock()
-			if head > cursor {
-				e.beginGapFill(head)
-				e.startBackfill(head)
-			}
-			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v",
-				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming())
+			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v catching_up=%v",
+				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming(), e.catchingUp.Load())
 		}
 	}
 }
 
-// confirmationLoop polls the chain head and scans up to safeHead when
-// confirmations > 0. Live subscription is disabled in this mode.
-func (e *EVMWatcher) confirmationLoop() {
-	defer e.wg.Done()
-
-	ctx := e.context()
-	ticker := time.NewTicker(e.pollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			head, err := e.blockNumber(ctx)
-			if err != nil {
-				e.logger.Errorf("failed to get block number: %v", err)
-				continue
-			}
-			target := e.safeHead(head)
-			if target > e.getLastBlock() {
-				e.beginGapFill(target)
-				if err := e.backfill(ctx, target); err != nil {
-					e.logger.Errorf("failed to scan confirmed blocks up to %d: %v", target, err)
-				}
-			} else {
-				e.heartbeatAt(ctx, head)
-			}
-		}
+// catchUpHead returns the backfill target for catch-up: raw head when
+// confirmations=0, safeHead(head) when confirmations>0.
+func (e *EVMWatcher) catchUpHead(head uint64) uint64 {
+	if e.confirmations == 0 {
+		return head
 	}
+	return e.safeHead(head)
 }
 
 // heartbeat persists the current scan progress and logs the chain head.
@@ -562,10 +523,35 @@ func (e *EVMWatcher) heartbeatAt(ctx context.Context, head uint64) {
 			return
 		}
 	}
-	cursor := e.getLastBlock()
-	e.reportWatermark(cursor)
-	e.logger.Infof("heartbeat: head=%d lastBlock=%d delivered=%d reported=%d",
-		head, cursor, e.deliveredBlock.Load(), e.getReportedBlock())
+	if e.catchingUp.Load() {
+		e.logger.Infof("heartbeat: catching_up head=%d lastBlock=%d target=%d",
+			head, e.getLastBlock(), e.getCatchUpTarget())
+		return
+	}
+	if e.confirmations > 0 {
+		e.flushPendingConfirm()
+		safe := e.safeHead(head)
+		if !e.hasBacklog() && safe > 0 && safe > e.getLastBlock() {
+			e.setLastBlock(safe)
+		}
+		if !e.hasBacklog() && safe > 0 {
+			e.reportWatermark(safe)
+		}
+		e.logger.Infof("heartbeat: head=%d safeHead=%d lastBlock=%d pending_confirm=%d reported=%d",
+			head, safe, e.getLastBlock(), e.pendingConfirmCount(), e.getReportedBlock())
+		return
+	}
+	// Live mode (confirmations=0): sync watermark to chain head when idle.
+	if e.hasBacklog() {
+		e.logger.Infof("heartbeat: backlog pending head=%d lastBlock=%d reported=%d",
+			head, e.getLastBlock(), e.getReportedBlock())
+		return
+	}
+	if head > e.getLastBlock() {
+		e.setLastBlock(head)
+	}
+	e.reportWatermark(e.getLastBlock())
+	e.logger.Infof("heartbeat: head=%d watermark=%d", head, e.getLastBlock())
 }
 
 // safeHead returns head - confirmations. When confirmations is 0 it returns head.
@@ -603,48 +589,63 @@ func (e *EVMWatcher) applyGapStrategy(head uint64, stored int64) {
 	e.reportWatermark(skipTo)
 }
 
-// beginGapFill marks a catch-up in progress and blocks the WSS stream from
-// delivering logs ahead of the backfill cursor.
-func (e *EVMWatcher) beginGapFill(head uint64) {
+// beginCatchUp marks startup/resubscribe backfill in progress. WSS logs ahead
+// of the backfill cursor are dropped until catch-up completes.
+func (e *EVMWatcher) beginCatchUp(head uint64) {
 	if head == 0 {
 		return
 	}
 	for {
-		current := e.getGapFillTarget()
+		current := e.getCatchUpTarget()
 		if current >= head {
 			break
 		}
-		if e.gapFillTarget.CompareAndSwap(current, head) {
+		if e.catchUpTarget.CompareAndSwap(current, head) {
 			break
 		}
 	}
+	e.catchingUp.Store(true)
 	e.setStreaming(false)
 }
 
-func (e *EVMWatcher) getGapFillTarget() uint64 {
-	return e.gapFillTarget.Load()
+func (e *EVMWatcher) getCatchUpTarget() uint64 {
+	return e.catchUpTarget.Load()
 }
 
 func (e *EVMWatcher) shouldBlockStreamLog(blockNum uint64) bool {
-	target := e.getGapFillTarget()
-	if target == 0 {
+	if !e.catchingUp.Load() {
 		return false
 	}
-	last := e.getLastBlock()
-	if last >= target {
-		return false
-	}
-	return blockNum > last
+	return blockNum > e.getLastBlock()
 }
 
-func (e *EVMWatcher) maybeClearGapFill() {
-	target := e.getGapFillTarget()
-	if target == 0 || e.getLastBlock() < target {
+// endCatchUp marks catch-up complete and enables live WSS delivery.
+func (e *EVMWatcher) endCatchUp() {
+	target := e.getCatchUpTarget()
+	if target > 0 && e.getLastBlock() < target {
 		return
 	}
-	e.gapFillTarget.Store(0)
+	e.catchUpTarget.Store(0)
+	e.catchingUp.Store(false)
 	e.setStreaming(true)
-	e.logger.Infof("gap fill complete at block %d", e.getLastBlock())
+	if !e.hasBacklog() {
+		head := e.latestHead.Load()
+		if e.confirmations > 0 {
+			safe := e.safeHead(head)
+			if safe > 0 {
+				if safe > e.getLastBlock() {
+					e.setLastBlock(safe)
+				}
+				e.reportWatermark(safe)
+			}
+		} else if head > 0 {
+			if head > e.getLastBlock() {
+				e.setLastBlock(head)
+			}
+			e.reportWatermark(e.getLastBlock())
+		}
+	}
+	e.logger.Infof("catch-up complete: lastBlock=%d", e.getLastBlock())
 }
 
 // effectiveBackfillHead caps the scan target for one backfill run.
@@ -663,16 +664,81 @@ func (e *EVMWatcher) effectiveBackfillHead(head uint64) uint64 {
 	return maxTo
 }
 
-// startBackfill runs backfill in the background so Start() is not blocked.
-func (e *EVMWatcher) startBackfill(head uint64) {
+// startBackfill runs catch-up backfill in the background until the target head
+// is reached, then switches to live mode.
+func (e *EVMWatcher) startBackfill(target uint64) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
 		ctx := e.context()
-		if err := e.backfill(ctx, head); err != nil && ctx.Err() == nil {
-			e.logger.Errorf("backfill failed up to %d: %v", head, err)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			head, err := e.blockNumber(ctx)
+			if err != nil {
+				e.logger.Errorf("catch-up: failed to get block number: %v", err)
+				time.Sleep(time.Second)
+				continue
+			}
+			newTarget := e.catchUpHead(head)
+			if newTarget == 0 {
+				time.Sleep(e.pollInterval)
+				continue
+			}
+			if newTarget > target {
+				target = newTarget
+				e.beginCatchUp(target)
+			}
+			if e.getLastBlock() >= target {
+				break
+			}
+			if err := e.backfill(ctx, target); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				e.logger.Errorf("catch-up backfill failed up to %d: %v", target, err)
+				time.Sleep(time.Second)
+				continue
+			}
+			if e.getLastBlock() >= target {
+				break
+			}
 		}
+		e.endCatchUp()
 	}()
+}
+
+// runCatchUp blocks until backfill reaches target, used during resubscribe.
+func (e *EVMWatcher) runCatchUp(ctx context.Context, target uint64) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		head, err := e.blockNumber(ctx)
+		if err != nil {
+			return err
+		}
+		newTarget := e.catchUpHead(head)
+		if newTarget == 0 {
+			time.Sleep(e.pollInterval)
+			continue
+		}
+		if newTarget > target {
+			target = newTarget
+			e.beginCatchUp(target)
+		}
+		if e.getLastBlock() >= target {
+			return nil
+		}
+		if err := e.backfill(ctx, target); err != nil {
+			return err
+		}
+	}
 }
 
 // backfill scans from the recorded progress up to head in batches.
@@ -694,7 +760,6 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 				e.logger.Infof("backfill partial: scanned_to=%d chain_head=%d max_catch_up=%d",
 					e.getLastBlock(), head, e.maxCatchUpBlocks)
 			}
-			e.maybeClearGapFill()
 			return nil
 		}
 		to := from + e.getMaxBlockRange() - 1
@@ -716,7 +781,9 @@ func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 
 		e.logger.Infof("backfill batch done: from=%d to=%d logs=%d scanned_to=%d", from, to, len(logs), scanned)
 		e.setLastBlock(scanned)
-		e.reportWatermark(scanned)
+		if e.confirmations > 0 {
+			e.reportWatermark(scanned)
+		}
 	}
 }
 
@@ -883,22 +950,8 @@ func (e *EVMWatcher) notifyLoop() {
 		case event := <-e.eventCh:
 			e.notify(event)
 		case <-ctx.Done():
-			// Deliver the already decoded events that are still within safeHead.
-			for {
-				select {
-				case event := <-e.eventCh:
-					if e.confirmations > 0 {
-						safe := e.safeHead(e.latestHead.Load())
-						if event.BlockNumber > safe {
-							e.pendingEvents.Add(-1)
-							continue
-						}
-					}
-					e.notify(event)
-				default:
-					return
-				}
-			}
+			e.drainPendingOnStop()
+			return
 		}
 	}
 }
@@ -907,26 +960,59 @@ func (e *EVMWatcher) notify(event *Event) {
 	if e.confirmations > 0 {
 		safe := e.safeHead(e.latestHead.Load())
 		if event.BlockNumber > safe {
-			// Unconfirmed events must not be delivered; drop and leave watermark.
-			e.pendingEvents.Add(-1)
-			e.logger.Warnf("drop unconfirmed event %s of %s at block %d (safeHead %d)",
-				event.EventName, event.ContractAddress.Hex(), event.BlockNumber, safe)
+			e.holdForConfirm(event)
 			return
 		}
 	}
+	e.deliverEvent(event)
+}
 
+func (e *EVMWatcher) holdForConfirm(event *Event) {
+	e.confirmMu.Lock()
+	e.pendingConfirm = append(e.pendingConfirm, event)
+	e.confirmMu.Unlock()
+	e.logger.Infof("held for confirmation: event=%s block=%d safeHead=%d",
+		event.EventName, event.BlockNumber, e.safeHead(e.latestHead.Load()))
+}
+
+func (e *EVMWatcher) pendingConfirmCount() int {
+	e.confirmMu.Lock()
+	defer e.confirmMu.Unlock()
+	return len(e.pendingConfirm)
+}
+
+// flushPendingConfirm delivers held events that have enough confirmations.
+func (e *EVMWatcher) flushPendingConfirm() {
+	safe := e.safeHead(e.latestHead.Load())
+	if safe == 0 {
+		return
+	}
+	e.confirmMu.Lock()
+	n := 0
+	for n < len(e.pendingConfirm) && e.pendingConfirm[n].BlockNumber <= safe {
+		n++
+	}
+	if n == 0 {
+		e.confirmMu.Unlock()
+		return
+	}
+	ready := append([]*Event(nil), e.pendingConfirm[:n]...)
+	e.pendingConfirm = e.pendingConfirm[n:]
+	e.confirmMu.Unlock()
+	for _, event := range ready {
+		e.deliverEvent(event)
+	}
+}
+
+func (e *EVMWatcher) deliverEvent(event *Event) {
 	err := e.event.OnEvent(e.chainName, event)
 	e.pendingEvents.Add(-1)
 	if err != nil {
-		// Do not advance the watermark on failure, so a restart can rescan
-		// this block and deliver the event again.
 		e.logger.Errorf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
 		return
 	}
 	e.logger.Infof("delivered: event=%s block=%d tx=%s",
 		event.EventName, event.BlockNumber, event.TxHash.Hex())
-	// Persist progress right after a successful delivery, so a restart will not
-	// reprocess the same event.
 	if event.BlockNumber > e.deliveredBlock.Load() {
 		e.deliveredBlock.Store(event.BlockNumber)
 	}
@@ -934,10 +1020,34 @@ func (e *EVMWatcher) notify(event *Event) {
 	e.reportDelivered(event.BlockNumber)
 }
 
+func (e *EVMWatcher) drainPendingOnStop() {
+	for {
+		select {
+		case event := <-e.eventCh:
+			e.notify(event)
+		default:
+			if e.confirmations > 0 {
+				e.flushPendingConfirm()
+				e.confirmMu.Lock()
+				for range e.pendingConfirm {
+					e.pendingEvents.Add(-1)
+				}
+				e.pendingConfirm = nil
+				e.confirmMu.Unlock()
+			}
+			return
+		}
+	}
+}
+
 // reportDelivered persists the delivery progress at most once every
 // deliveryReportInterval. The final flush in Stop bypasses the throttle by
 // calling reportWatermark directly.
 func (e *EVMWatcher) reportDelivered(blockNumber uint64) {
+	if e.confirmations == 0 {
+		e.reportWatermark(blockNumber)
+		return
+	}
 	e.reportMu.Lock()
 	throttled := time.Since(e.lastDeliveryReport) < deliveryReportInterval
 	if !throttled {
@@ -953,6 +1063,9 @@ func (e *EVMWatcher) reportDelivered(blockNumber uint64) {
 // hasBacklog reports whether some received logs or decoded events are still on
 // their way to the caller.
 func (e *EVMWatcher) hasBacklog() bool {
+	if e.pendingConfirmCount() > 0 {
+		return true
+	}
 	return e.pendingEvents.Load() > 0 || len(e.logCh) > 0
 }
 
@@ -1071,9 +1184,10 @@ func (e *EVMWatcher) resubscribe() {
 			e.logger.Errorf("failed to get block number: %v", err)
 			continue
 		}
-		if e.getLastBlock() < head {
-			e.beginGapFill(head)
-			if err := e.backfill(ctx, head); err != nil {
+		catchTarget := e.catchUpHead(head)
+		if catchTarget > 0 && e.getLastBlock() < catchTarget {
+			e.beginCatchUp(catchTarget)
+			if err := e.runCatchUp(ctx, catchTarget); err != nil {
 				e.logger.Errorf("failed to scan the missed blocks: %v", err)
 				continue
 			}
@@ -1084,20 +1198,20 @@ func (e *EVMWatcher) resubscribe() {
 		}
 		if head, err := e.blockNumber(ctx); err != nil {
 			e.logger.Errorf("failed to get block number after resubscribe: %v", err)
-		} else if e.getLastBlock() < head {
-			e.beginGapFill(head)
-			if err := e.backfill(ctx, head); err != nil {
-				e.logger.Errorf("failed to catch up after resubscribe: %v", err)
-				continue
+		} else {
+			catchTarget = e.catchUpHead(head)
+			if catchTarget > 0 && e.getLastBlock() < catchTarget {
+				e.beginCatchUp(catchTarget)
+				if err := e.runCatchUp(ctx, catchTarget); err != nil {
+					e.logger.Errorf("failed to catch up after resubscribe: %v", err)
+					continue
+				}
 			}
 		}
 
-		e.maybeClearGapFill()
-		if !e.isStreaming() && e.getGapFillTarget() > 0 {
-			e.startBackfill(e.getGapFillTarget())
-		}
-		e.logger.Infof("log subscription recovered at block %d streaming=%v gap_target=%d",
-			e.getLastBlock(), e.isStreaming(), e.getGapFillTarget())
+		e.endCatchUp()
+		e.logger.Infof("log subscription recovered at block %d streaming=%v",
+			e.getLastBlock(), e.isStreaming())
 		return
 	}
 }
