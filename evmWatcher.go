@@ -72,8 +72,9 @@ type watchTarget struct {
 // EVMWatcher watches multiple contracts of one chain over a single connection,
 // so that the whole chain shares one consistent block progress.
 type EVMWatcher struct {
-	// chainName identifies the watched chain for the storage and the event
-	// callbacks, it is provided by the caller.
+	// chainName identifies the watched deployment for storage and callbacks. It
+	// must be unique to the actual network (and contract set when deployments
+	// must not share progress), for example "pharos-mainnet-1672".
 	chainName string
 	wssURL    string
 	ethClient *ethclient.Client
@@ -143,13 +144,13 @@ type EVMWatcher struct {
 	maxCatchUpBlocks uint64
 	// catchUpTarget is the chain head startup/resubscribe backfill must reach
 	// before live WSS delivery is enabled. 0 means catch-up is complete.
-	catchUpTarget atomic.Uint64
-	catchingUp    atomic.Bool
+	catchUpTarget  atomic.Uint64
+	catchingUp     atomic.Bool
 	gapHealRunning atomic.Bool
 
 	// pendingConfirm holds decoded events waiting for N-block confirmation.
-	confirmMu        sync.Mutex
-	pendingConfirm   []*Event
+	confirmMu      sync.Mutex
+	pendingConfirm []*Event
 }
 
 type Option func(*EVMWatcher)
@@ -293,6 +294,10 @@ func (e *EVMWatcher) Start() error {
 	startAt := head
 	if e.confirmations > 0 {
 		startAt = e.safeHead(head)
+	}
+	if err := validateStoredWatermark(e.chainName, stored, head, startAt); err != nil {
+		e.release(cancel, client)
+		return err
 	}
 	if stored < 0 {
 		// no progress recorded, watch from the current (safe) head
@@ -573,27 +578,46 @@ func (e *EVMWatcher) safeHead(head uint64) uint64 {
 	return head - e.confirmations
 }
 
+// validateStoredWatermark rejects progress that cannot belong to the current
+// chain state. In confirmation mode the persisted watermark must also not be
+// ahead of the current safe head, otherwise restarting could skip unconfirmed
+// blocks after the confirmation policy changes.
+func validateStoredWatermark(chainName string, stored int64, head, startAt uint64) error {
+	if stored < 0 {
+		return nil
+	}
+	watermark := uint64(stored)
+	if watermark > head {
+		return fmt.Errorf("stored watermark %d is ahead of chain head %d for chain %s",
+			stored, head, chainName)
+	}
+	if watermark > startAt {
+		return fmt.Errorf("stored watermark %d is ahead of safe head %d (chain head %d) for chain %s",
+			stored, startAt, head, chainName)
+	}
+	return nil
+}
+
 // applyGapStrategy jumps over historical blocks when the stored gap exceeds
 // skipGapThreshold.
 func (e *EVMWatcher) applyGapStrategy(head uint64, stored int64) {
 	if stored < 0 || e.skipGapThreshold == 0 {
 		return
 	}
-	gap := head - uint64(stored)
-	if gap <= e.skipGapThreshold {
+	skipTo := e.catchUpHead(head)
+	// Startup validation normally guarantees this. Keep the strategy safe on
+	// its own as well: subtracting a watermark ahead of the target would wrap.
+	if uint64(stored) >= skipTo {
 		return
 	}
-	skipTo := head
-	if e.confirmations > 0 {
-		skipTo = e.safeHead(head)
+	gap := skipTo - uint64(stored)
+	if gap <= e.skipGapThreshold {
+		return
 	}
 	e.logger.Warnf("skip gap: stored=%d head=%d gap=%d threshold=%d skip_to=%d",
 		stored, head, gap, e.skipGapThreshold, skipTo)
 	e.setLastBlock(skipTo)
 	e.deliveredBlock.Store(skipTo)
-	e.reportMu.Lock()
-	e.reportedBlock = skipTo
-	e.reportMu.Unlock()
 	e.reportWatermark(skipTo)
 }
 
