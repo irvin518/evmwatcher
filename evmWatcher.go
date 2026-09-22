@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,19 +26,35 @@ const (
 	// provider rate limit
 	defaultRequestInterval = 200 * time.Millisecond
 	// interval of getting the node head and reporting it through SetWatchedBlockNumber
-	checkpointInterval = 2 * time.Minute
-	heartbeatInterval  = 30 * time.Second
-	logChannelBuffer   = 4096
-	eventChannelBuffer = 4096
-	resubscribeDelay   = 5 * time.Second
-	// minimum gap between two delivery-driven watermark writes, keeps a busy
-	// stream from turning into one storage write per block
-	deliveryReportInterval = 5 * time.Second
-	rateLimitBackoff       = time.Second
-	maxRateLimitBackoff    = 30 * time.Second
-	defaultPollInterval    = 3 * time.Second
-	filterLogsTimeout      = 30 * time.Second
+	checkpointInterval    = 2 * time.Minute
+	heartbeatInterval     = 30 * time.Second
+	logChannelBuffer      = 4096
+	eventChannelBuffer    = 4096
+	resubscribeDelay      = 5 * time.Second
+	maxResubscribeDelay   = 30 * time.Second
+	rateLimitBackoff      = time.Second
+	maxRateLimitBackoff   = 30 * time.Second
+	defaultPollInterval   = 3 * time.Second
+	filterLogsTimeout     = 30 * time.Second
+	blockNumberTimeout    = 15 * time.Second
+	streamCatchUpBuffer   = 4096
+	deliveryRetryInitial  = time.Second
+	deliveryRetryMax      = 30 * time.Second
+	dedupeRetentionBlocks = uint64(128)
 )
+
+type subscriptionFailure struct {
+	Generation uint64
+	Err        error
+}
+
+type eventKey struct {
+	BlockHash common.Hash
+	TxHash    common.Hash
+	Address   common.Address
+	LogIndex  uint
+	Removed   bool
+}
 
 // WatcherData describes one contract and the events watched on it.
 type WatcherData struct {
@@ -95,6 +112,13 @@ type EVMWatcher struct {
 	// streaming is true only when the log subscription is alive and the gap it
 	// left behind has been scanned, the progress may advance only in that case.
 	streaming bool
+	// subFailures is stable for the lifetime of a Start call. Subscription
+	// specific Err channels are forwarded here with a generation so replacing
+	// a subscription cannot leave eventLoop waiting on a stale/nil channel.
+	subFailures   chan subscriptionFailure
+	subGeneration uint64
+	subscribeMu   sync.Mutex
+	catchUpDoneCh chan struct{}
 
 	// maxBlockRange is shrunk at runtime once the provider reports a cap
 	// smaller than the configured one.
@@ -106,11 +130,15 @@ type EVMWatcher struct {
 
 	// confirmations delays delivery and watermark until a block is N blocks
 	// behind the chain head. 0 keeps the live subscription path.
-	confirmations uint64
-	pollInterval  time.Duration
+	confirmations   uint64
+	pollInterval    time.Duration
+	gapHealInterval time.Duration
 	// latestHead is the freshest BlockNumber we have seen, used to clamp
 	// watermarks and Stop flush to safeHead without an extra RPC.
 	latestHead atomic.Uint64
+	// lastStreamLogUnixNano records receipt of raw subscription traffic. A quiet
+	// contract does not by itself imply a broken subscription.
+	lastStreamLogUnixNano atomic.Int64
 
 	// pendingEvents counts the events decoded but not yet handed to OnEvent,
 	// deliveredBlock is the highest block an event has been delivered for.
@@ -120,9 +148,16 @@ type EVMWatcher struct {
 	// reportedBlock is the watermark persisted through SetWatchedBlockNumber,
 	// it never regresses. Guarded by reportMu, which is held across the storage
 	// call so the writes cannot land out of order.
-	reportMu           sync.Mutex
-	reportedBlock      uint64
-	lastDeliveryReport time.Time
+	reportMu      sync.Mutex
+	reportedBlock uint64
+
+	// lastBlock is the highest continuously scanned block (scannedThrough), not
+	// the highest block observed on the live stream. pendingByBlock protects the
+	// committed watermark from crossing an event that has not been delivered.
+	progressMu       sync.Mutex
+	pendingByBlock   map[uint64]int
+	seenEvents       map[eventKey]uint64
+	committedThrough atomic.Uint64
 
 	reloadCh chan struct{}
 	ctx      context.Context
@@ -147,10 +182,6 @@ type EVMWatcher struct {
 	catchUpTarget  atomic.Uint64
 	catchingUp     atomic.Bool
 	gapHealRunning atomic.Bool
-
-	// pendingConfirm holds decoded events waiting for N-block confirmation.
-	confirmMu      sync.Mutex
-	pendingConfirm []*Event
 }
 
 type Option func(*EVMWatcher)
@@ -191,6 +222,16 @@ func WithPollInterval(d time.Duration) Option {
 	}
 }
 
+// WithGapHealInterval sets how often zero-confirmation mode scans for logs the
+// live subscription may have missed. It is independent from confirmation polling.
+func WithGapHealInterval(d time.Duration) Option {
+	return func(e *EVMWatcher) {
+		if d > 0 {
+			e.gapHealInterval = d
+		}
+	}
+}
+
 // WithSkipGapThreshold skips historical catch-up when head-stored exceeds this
 // value and jumps the cursor to the current (safe) head. 0 disables skipping.
 func WithSkipGapThreshold(blocks uint64) Option {
@@ -218,7 +259,10 @@ func NewEVMWatcher(chainName, wssURL string, watcherData []WatcherData, storage 
 		maxBlockRange:   defaultMaxBlockRange,
 		requestInterval: defaultRequestInterval,
 		pollInterval:    defaultPollInterval,
+		gapHealInterval: heartbeatInterval,
 		reloadCh:        make(chan struct{}, 1),
+		pendingByBlock:  make(map[uint64]int),
+		seenEvents:      make(map[eventKey]uint64),
 	}
 	for _, option := range options {
 		option(watcher)
@@ -270,6 +314,8 @@ func (e *EVMWatcher) Start() error {
 	e.targets = targets
 	e.logCh = make(chan types.Log, logChannelBuffer)
 	e.eventCh = make(chan *Event, eventChannelBuffer)
+	e.subFailures = make(chan subscriptionFailure, 16)
+	e.catchUpDoneCh = make(chan struct{}, 1)
 	e.ctx, e.cancel = ctx, cancel
 	e.mu.Unlock()
 
@@ -299,15 +345,28 @@ func (e *EVMWatcher) Start() error {
 		e.release(cancel, client)
 		return err
 	}
-	if stored < 0 {
-		// no progress recorded, watch from the current (safe) head
-		e.setLastBlock(startAt)
-	} else {
-		e.setLastBlock(uint64(stored))
+	initialBlock := startAt
+	if stored >= 0 {
+		initialBlock = uint64(stored)
 	}
+	// A stopped watcher can be started again. Rebuild all in-memory delivery
+	// state from the durable committed watermark so uncommitted events replay.
+	e.mu.Lock()
+	e.lastBlock = initialBlock
+	e.mu.Unlock()
+	e.progressMu.Lock()
+	e.pendingByBlock = make(map[uint64]int)
+	e.seenEvents = make(map[eventKey]uint64)
+	e.progressMu.Unlock()
+	e.pendingEvents.Store(0)
+	e.catchUpTarget.Store(0)
+	e.catchingUp.Store(false)
+	e.gapHealRunning.Store(false)
+	e.lastStreamLogUnixNano.Store(0)
 	// Everything up to the starting point was delivered by the previous run.
 	initial := e.getLastBlock()
 	e.deliveredBlock.Store(initial)
+	e.committedThrough.Store(initial)
 	e.reportMu.Lock()
 	e.reportedBlock = initial
 	e.reportMu.Unlock()
@@ -330,21 +389,30 @@ func (e *EVMWatcher) Start() error {
 	e.started = true
 	e.mu.Unlock()
 
-	e.wg.Add(2)
-	go e.eventLoop()
-	go e.checkpointLoop()
-
 	if err := e.subscribe(); err != nil {
 		e.Stop()
 		return err
 	}
 
-	catchTarget := e.catchUpHead(head)
+	// Read the catch-up target after the subscription is live. Logs arriving
+	// during this query remain in logCh and are buffered by eventLoop.
+	postSubscribeHead, err := e.blockNumber(ctx)
+	if err != nil {
+		e.Stop()
+		return fmt.Errorf("failed to get block number after subscribing: %w", err)
+	}
+	catchTarget := e.catchUpHead(postSubscribeHead)
 	if catchTarget > 0 && e.getLastBlock() < catchTarget {
 		e.beginCatchUp(catchTarget)
-		e.startBackfill(catchTarget)
 	} else {
 		e.setStreaming(true)
+	}
+
+	e.wg.Add(2)
+	go e.eventLoop()
+	go e.checkpointLoop()
+	if e.catchingUp.Load() {
+		e.startBackfill(catchTarget)
 	}
 	return nil
 }
@@ -359,6 +427,7 @@ func (e *EVMWatcher) Stop() {
 	e.streaming = false
 	cancel, sub, client := e.cancel, e.sub, e.ethClient
 	e.sub = nil
+	e.subGeneration++
 	e.mu.Unlock()
 
 	if cancel != nil {
@@ -368,9 +437,9 @@ func (e *EVMWatcher) Stop() {
 		sub.Unsubscribe()
 	}
 	e.wg.Wait()
-	// Flush the final watermark after the pending events are drained.
-	// Never persist above the current safe head when confirmations are on.
-	candidate := e.getLastBlock()
+	// Flush only the safe committed watermark. Queued/failed events remain
+	// behind it and are replayed from storage on the next start.
+	candidate := e.committedThrough.Load()
 	if e.confirmations > 0 {
 		safe := e.safeHead(e.latestHead.Load())
 		if safe < candidate {
@@ -443,32 +512,111 @@ func (e *EVMWatcher) eventLoop() {
 	defer e.wg.Done()
 
 	ctx := e.context()
+	buffered := make([]types.Log, 0, streamCatchUpBuffer)
+	flushBuffered := func(finishCatchUp bool) bool {
+		if e.catchingUp.Load() && !finishCatchUp {
+			return false
+		}
+		if finishCatchUp {
+			target := e.getCatchUpTarget()
+			if target > 0 && e.getLastBlock() < target {
+				return false
+			}
+		}
+		if len(buffered) > 0 {
+			sort.SliceStable(buffered, func(i, j int) bool {
+				if buffered[i].BlockNumber != buffered[j].BlockNumber {
+					return buffered[i].BlockNumber < buffered[j].BlockNumber
+				}
+				if buffered[i].TxIndex != buffered[j].TxIndex {
+					return buffered[i].TxIndex < buffered[j].TxIndex
+				}
+				return buffered[i].Index < buffered[j].Index
+			})
+			for _, vLog := range buffered {
+				e.dispatchLog(vLog, "subscription-buffer")
+			}
+			e.logger.Infof("catch-up stream buffer flushed: logs=%d", len(buffered))
+			buffered = buffered[:0]
+		}
+		if !finishCatchUp {
+			e.advanceCommittedThrough()
+			return true
+		}
+		e.catchUpTarget.Store(0)
+		e.catchingUp.Store(false)
+		e.setStreaming(true)
+		e.advanceCommittedThrough()
+		e.logger.Infof("catch-up complete: scanned_through=%d committed_through=%d delivered=%d",
+			e.getLastBlock(), e.committedThrough.Load(), e.deliveredBlock.Load())
+		return true
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case vLog := <-e.logCh:
-			if e.shouldBlockStreamLog(vLog.BlockNumber) {
-				e.logger.Warnf("drop log: reason=catch_up_pending block=%d lastBlock=%d catch_up_target=%d",
-					vLog.BlockNumber, e.getLastBlock(), e.getCatchUpTarget())
+			e.lastStreamLogUnixNano.Store(time.Now().UnixNano())
+			if e.catchingUp.Load() {
+				if len(buffered) < streamCatchUpBuffer {
+					buffered = append(buffered, vLog)
+				} else {
+					// Apply backpressure instead of dropping. If the provider's own
+					// queue overflows, its error triggers subscription recovery.
+					e.logger.Warnf("catch-up stream buffer full: capacity=%d block=%d; applying backpressure",
+						streamCatchUpBuffer, vLog.BlockNumber)
+					for e.catchingUp.Load() {
+						select {
+						case <-ctx.Done():
+							return
+						case <-e.catchUpDoneCh:
+							flushBuffered(true)
+						}
+					}
+					e.dispatchLog(vLog, "subscription-buffer")
+				}
 				continue
 			}
+			flushBuffered(false)
 			if e.debug && len(vLog.Topics) > 0 {
 				e.logger.Debugf("raw log: block=%d tx=%s topic0=%s",
 					vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Topics[0].Hex())
 			}
-			e.dispatch(vLog)
-		case err := <-e.subError():
+			e.dispatchLog(vLog, "subscription")
+		case failure := <-e.subFailures:
+			if !e.isCurrentSubscription(failure.Generation) {
+				e.logger.Debugf("ignore stale subscription failure: generation=%d current=%d err=%v",
+					failure.Generation, e.currentSubscriptionGeneration(), failure.Err)
+				continue
+			}
 			// The blocks missed from now on are unknown, freeze the progress
 			// until the stream is back and the gap is scanned.
 			e.setStreaming(false)
-			e.logger.Errorf("log subscription broken: %v", err)
+			e.beginCatchUp(e.latestHead.Load())
+			e.logger.Errorf("log subscription broken: generation=%d err=%v", failure.Generation, failure.Err)
 			e.startResubscribe()
+		case <-e.catchUpDoneCh:
+			flushBuffered(true)
 		case <-e.reloadCh:
+			e.setStreaming(false)
+			e.beginCatchUp(e.latestHead.Load())
 			if err := e.subscribe(); err != nil {
-				e.setStreaming(false)
 				e.logger.Errorf("failed to apply the new watcher list: %v", err)
 				e.startResubscribe()
+				continue
+			}
+			head, err := e.blockNumber(ctx)
+			if err != nil {
+				e.logger.Errorf("failed to get reload catch-up head: %v", err)
+				e.startResubscribe()
+				continue
+			}
+			target := e.catchUpHead(head)
+			if target > e.getLastBlock() {
+				e.beginCatchUp(target)
+				e.startBackfill(target)
+			} else {
+				e.endCatchUp()
 			}
 		}
 	}
@@ -480,7 +628,7 @@ func (e *EVMWatcher) checkpointLoop() {
 	defer e.wg.Done()
 
 	ctx := e.context()
-	hbInterval := heartbeatInterval
+	hbInterval := e.gapHealInterval
 	if e.confirmations > 0 {
 		hbInterval = e.pollInterval
 	}
@@ -503,8 +651,8 @@ func (e *EVMWatcher) checkpointLoop() {
 			if e.confirmations == 0 {
 				e.maybeGapHeal(ctx, head)
 			}
-			e.logger.Infof("checkpoint tick: head=%d lastBlock=%d delivered=%d reported=%d streaming=%v catching_up=%v",
-				head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock(), e.isStreaming(), e.catchingUp.Load())
+			e.logger.Infof("checkpoint tick: head=%d scanned_through=%d committed_through=%d delivered=%d pending=%d reported=%d streaming=%v catching_up=%v last_stream_log_unix_nano=%d",
+				head, e.getLastBlock(), e.committedThrough.Load(), e.deliveredBlock.Load(), e.pendingEvents.Load(), e.getReportedBlock(), e.isStreaming(), e.catchingUp.Load(), e.lastStreamLogUnixNano.Load())
 		}
 	}
 }
@@ -538,33 +686,22 @@ func (e *EVMWatcher) heartbeatAt(ctx context.Context, head uint64) {
 		return
 	}
 	if e.confirmations > 0 {
-		e.flushPendingConfirm()
 		safe := e.safeHead(head)
-		if !e.hasBacklog() && safe > 0 && safe > e.getLastBlock() {
-			e.setLastBlock(safe)
-		}
-		if !e.hasBacklog() && safe > 0 {
-			e.reportWatermark(safe)
-		}
-		e.logger.Infof("heartbeat: head=%d safeHead=%d lastBlock=%d pending_confirm=%d reported=%d",
-			head, safe, e.getLastBlock(), e.pendingConfirmCount(), e.getReportedBlock())
+		e.maybeGapHeal(ctx, head)
+		e.reportWatermark(e.committedThrough.Load())
+		e.logger.Infof("heartbeat: head=%d safeHead=%d scanned_through=%d committed_through=%d pending=%d reported=%d",
+			head, safe, e.getLastBlock(), e.committedThrough.Load(), e.pendingEvents.Load(), e.getReportedBlock())
 		return
 	}
 	// Live mode (confirmations=0): never push watermark past delivered without
 	// a FilterLogs scan; heal gaps when chain head runs ahead of delivery.
-	if e.hasBacklog() {
-		e.logger.Infof("heartbeat: backlog pending head=%d lastBlock=%d delivered=%d reported=%d",
-			head, e.getLastBlock(), e.deliveredBlock.Load(), e.getReportedBlock())
-		return
-	}
-	delivered := e.deliveredBlock.Load()
-	if head > delivered {
+	if head > e.getLastBlock() {
 		e.maybeGapHeal(ctx, head)
 		return
 	}
-	e.reportWatermark(delivered)
+	e.reportWatermark(e.committedThrough.Load())
 	e.logger.Infof("heartbeat: head=%d delivered=%d reported=%d",
-		head, delivered, e.getReportedBlock())
+		head, e.deliveredBlock.Load(), e.getReportedBlock())
 }
 
 // safeHead returns head - confirmations. When confirmations is 0 it returns head.
@@ -618,11 +755,12 @@ func (e *EVMWatcher) applyGapStrategy(head uint64, stored int64) {
 		stored, head, gap, e.skipGapThreshold, skipTo)
 	e.setLastBlock(skipTo)
 	e.deliveredBlock.Store(skipTo)
+	e.committedThrough.Store(skipTo)
 	e.reportWatermark(skipTo)
 }
 
-// beginCatchUp marks startup/resubscribe backfill in progress. WSS logs ahead
-// of the backfill cursor are dropped until catch-up completes.
+// beginCatchUp marks startup/resubscribe backfill in progress. WSS logs are
+// buffered by eventLoop until the scan and stream can be merged and deduplicated.
 func (e *EVMWatcher) beginCatchUp(head uint64) {
 	if head == 0 {
 		return
@@ -644,43 +782,17 @@ func (e *EVMWatcher) getCatchUpTarget() uint64 {
 	return e.catchUpTarget.Load()
 }
 
-func (e *EVMWatcher) shouldBlockStreamLog(blockNum uint64) bool {
-	if !e.catchingUp.Load() {
-		return false
-	}
-	return blockNum > e.getLastBlock()
-}
-
-// endCatchUp marks catch-up complete and enables live WSS delivery.
+// endCatchUp asks eventLoop to merge buffered WSS logs and complete the mode
+// switch. eventLoop keeps catchingUp true until every buffered log is registered.
 func (e *EVMWatcher) endCatchUp() {
 	target := e.getCatchUpTarget()
 	if target > 0 && e.getLastBlock() < target {
 		return
 	}
-	e.catchUpTarget.Store(0)
-	e.catchingUp.Store(false)
-	e.setStreaming(true)
-	if !e.hasBacklog() {
-		head := e.latestHead.Load()
-		if e.confirmations > 0 {
-			safe := e.safeHead(head)
-			if safe > 0 {
-				if safe > e.getLastBlock() {
-					e.setLastBlock(safe)
-				}
-				e.reportWatermark(safe)
-			}
-		} else if head > 0 {
-			delivered := e.deliveredBlock.Load()
-			wm := e.getLastBlock()
-			if delivered > wm {
-				wm = delivered
-			}
-			e.reportWatermark(wm)
-		}
+	select {
+	case e.catchUpDoneCh <- struct{}{}:
+	default:
 	}
-	e.logger.Infof("catch-up complete: lastBlock=%d delivered=%d",
-		e.getLastBlock(), e.deliveredBlock.Load())
 }
 
 // effectiveBackfillHeadFrom caps the scan target for one backfill run starting at from.
@@ -698,38 +810,40 @@ func (e *EVMWatcher) effectiveBackfillHeadFrom(from, head uint64) uint64 {
 	return maxTo
 }
 
-// effectiveBackfillHead caps the scan target for one backfill run.
-func (e *EVMWatcher) effectiveBackfillHead(head uint64) uint64 {
-	return e.effectiveBackfillHeadFrom(e.getLastBlock()+1, head)
-}
-
-// maybeGapHeal scans [delivered+1, head] when WSS may have missed logs.
+// maybeGapHeal scans [scannedThrough+1, safeHead] while buffering WSS logs.
 // Safe to call from heartbeat/checkpoint; backfillMu serializes work.
 func (e *EVMWatcher) maybeGapHeal(ctx context.Context, head uint64) {
-	if e.confirmations > 0 || e.catchingUp.Load() || !e.isStreaming() {
+	if e.catchingUp.Load() || !e.isStreaming() {
 		return
 	}
-	delivered := e.deliveredBlock.Load()
-	if head <= delivered {
+	target := e.catchUpHead(head)
+	if target <= e.getLastBlock() {
 		return
 	}
-	// Continue from the scan cursor when empty ranges were already verified;
-	// fall back to delivered+1 when lastBlock has not moved past delivery.
 	from := e.getLastBlock() + 1
-	if from <= delivered {
-		from = delivered + 1
-	}
 	e.logger.Infof("gap heal: delivered=%d head=%d lastBlock=%d scan=[%d,%d]",
-		delivered, head, e.getLastBlock(), from, e.effectiveBackfillHeadFrom(from, head))
+		e.deliveredBlock.Load(), head, e.getLastBlock(), from, e.effectiveBackfillHeadFrom(from, target))
 	if !e.gapHealRunning.CompareAndSwap(false, true) {
 		return
 	}
+	e.beginCatchUp(target)
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
 		defer e.gapHealRunning.Store(false)
-		if err := e.backfillFrom(ctx, from, head); err != nil && ctx.Err() == nil {
-			e.logger.Errorf("gap heal failed [%d,%d]: %v", from, head, err)
+		for {
+			if err := e.runCatchUp(ctx, target); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				e.logger.Errorf("gap heal failed [%d,%d]: %v", from, target, err)
+				if !waitContext(ctx, time.Second) {
+					return
+				}
+				continue
+			}
+			e.endCatchUp()
+			return
 		}
 	}()
 }
@@ -750,12 +864,16 @@ func (e *EVMWatcher) startBackfill(target uint64) {
 			head, err := e.blockNumber(ctx)
 			if err != nil {
 				e.logger.Errorf("catch-up: failed to get block number: %v", err)
-				time.Sleep(time.Second)
+				if !waitContext(ctx, time.Second) {
+					return
+				}
 				continue
 			}
 			newTarget := e.catchUpHead(head)
 			if newTarget == 0 {
-				time.Sleep(e.pollInterval)
+				if !waitContext(ctx, e.pollInterval) {
+					return
+				}
 				continue
 			}
 			if newTarget > target {
@@ -770,7 +888,9 @@ func (e *EVMWatcher) startBackfill(target uint64) {
 					return
 				}
 				e.logger.Errorf("catch-up backfill failed up to %d: %v", target, err)
-				time.Sleep(time.Second)
+				if !waitContext(ctx, time.Second) {
+					return
+				}
 				continue
 			}
 			if e.getLastBlock() >= target {
@@ -795,7 +915,9 @@ func (e *EVMWatcher) runCatchUp(ctx context.Context, target uint64) error {
 		}
 		newTarget := e.catchUpHead(head)
 		if newTarget == 0 {
-			time.Sleep(e.pollInterval)
+			if !waitContext(ctx, e.pollInterval) {
+				return ctx.Err()
+			}
 			continue
 		}
 		if newTarget > target {
@@ -811,14 +933,24 @@ func (e *EVMWatcher) runCatchUp(ctx context.Context, target uint64) error {
 	}
 }
 
+func waitContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // backfill scans from the recorded progress up to head in batches.
 func (e *EVMWatcher) backfill(ctx context.Context, head uint64) error {
 	return e.backfillFrom(ctx, e.getLastBlock()+1, head)
 }
 
 // backfillFrom scans [from, head] in batches. The scan cursor is tracked locally
-// so a gap heal can rescan from delivered+1 even when lastBlock was advanced
-// incorrectly.
+// and lastBlock advances only after a complete FilterLogs batch succeeds.
 func (e *EVMWatcher) backfillFrom(ctx context.Context, from, head uint64) error {
 	e.backfillMu.Lock()
 	defer e.backfillMu.Unlock()
@@ -855,8 +987,17 @@ func (e *EVMWatcher) backfillFrom(ctx context.Context, from, head uint64) error 
 		if err != nil {
 			return err
 		}
+		sort.SliceStable(logs, func(i, j int) bool {
+			if logs[i].BlockNumber != logs[j].BlockNumber {
+				return logs[i].BlockNumber < logs[j].BlockNumber
+			}
+			if logs[i].TxIndex != logs[j].TxIndex {
+				return logs[i].TxIndex < logs[j].TxIndex
+			}
+			return logs[i].Index < logs[j].Index
+		})
 		for _, vLog := range logs {
-			e.dispatch(vLog)
+			e.dispatchLog(vLog, "backfill")
 		}
 
 		e.logger.Infof("backfill batch done: from=%d to=%d logs=%d scanned_to=%d", nextFrom, to, len(logs), scanned)
@@ -927,7 +1068,9 @@ func (e *EVMWatcher) blockNumber(ctx context.Context) (uint64, error) {
 	if err := e.waitRequestSlot(ctx); err != nil {
 		return 0, err
 	}
-	head, err := e.client().BlockNumber(ctx)
+	rpcCtx, cancel := context.WithTimeout(ctx, blockNumberTimeout)
+	defer cancel()
+	head, err := e.client().BlockNumber(rpcCtx)
 	if err != nil {
 		return 0, err
 	}
@@ -954,6 +1097,10 @@ func (e *EVMWatcher) waitRequestSlot(ctx context.Context) error {
 
 // dispatch decodes one log and notifies the caller through EventInterface.
 func (e *EVMWatcher) dispatch(vLog types.Log) {
+	e.dispatchLog(vLog, "unknown")
+}
+
+func (e *EVMWatcher) dispatchLog(vLog types.Log, source string) {
 	if len(vLog.Topics) == 0 {
 		return
 	}
@@ -994,30 +1141,43 @@ func (e *EVMWatcher) dispatch(vLog types.Log) {
 		Removed:         vLog.Removed,
 		Raw:             vLog,
 	}
-	for {
-		e.pendingEvents.Add(1)
-		select {
-		case e.eventCh <- ev:
-			e.logger.Infof("dispatch: event=%s block=%d tx=%s log_index=%d",
-				event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index)
-			return
-		case <-e.context().Done():
-			e.pendingEvents.Add(-1)
-			return
-		default:
-			e.pendingEvents.Add(-1)
-		}
-		select {
-		case e.eventCh <- ev:
-			e.pendingEvents.Add(1)
-			e.logger.Infof("dispatch: event=%s block=%d tx=%s log_index=%d",
-				event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index)
-			return
-		case <-e.context().Done():
-			return
-		case <-time.After(50 * time.Millisecond):
-		}
+	if !e.registerEvent(ev) {
+		e.logger.Debugf("deduplicated: source=%s event=%s block=%d tx=%s log_index=%d removed=%v",
+			source, event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index, vLog.Removed)
+		return
 	}
+	select {
+	case e.eventCh <- ev:
+		e.logger.Infof("dispatch: source=%s event=%s block=%d tx=%s log_index=%d removed=%v",
+			source, event.Name, vLog.BlockNumber, vLog.TxHash.Hex(), vLog.Index, vLog.Removed)
+	case <-e.context().Done():
+		// Keep the event pending so the committed watermark cannot cross it.
+		return
+	}
+}
+
+func keyForEvent(event *Event) eventKey {
+	return eventKey{
+		BlockHash: event.BlockHash,
+		TxHash:    event.TxHash,
+		Address:   event.ContractAddress,
+		LogIndex:  event.LogIndex,
+		Removed:   event.Removed,
+	}
+}
+
+func (e *EVMWatcher) registerEvent(event *Event) bool {
+	key := keyForEvent(event)
+	e.progressMu.Lock()
+	if _, exists := e.seenEvents[key]; exists {
+		e.progressMu.Unlock()
+		return false
+	}
+	e.seenEvents[key] = event.BlockNumber
+	e.pendingByBlock[event.BlockNumber]++
+	e.progressMu.Unlock()
+	e.pendingEvents.Add(1)
+	return true
 }
 
 // notifyLoop delivers the events to the caller, it is the only goroutine calling
@@ -1031,141 +1191,119 @@ func (e *EVMWatcher) notifyLoop() {
 		case event := <-e.eventCh:
 			e.notify(event)
 		case <-ctx.Done():
-			e.drainPendingOnStop()
 			return
 		}
 	}
 }
 
 func (e *EVMWatcher) notify(event *Event) {
-	if e.confirmations > 0 {
-		safe := e.safeHead(e.latestHead.Load())
-		if event.BlockNumber > safe {
-			e.holdForConfirm(event)
+	ctx := e.context()
+	for e.confirmations > 0 && event.BlockNumber > e.safeHead(e.latestHead.Load()) {
+		e.logger.Infof("held for confirmation: event=%s block=%d safeHead=%d",
+			event.EventName, event.BlockNumber, e.safeHead(e.latestHead.Load()))
+		select {
+		case <-ctx.Done():
 			return
+		case <-time.After(e.pollInterval):
 		}
 	}
 	e.deliverEvent(event)
 }
 
-func (e *EVMWatcher) holdForConfirm(event *Event) {
-	e.confirmMu.Lock()
-	e.pendingConfirm = append(e.pendingConfirm, event)
-	e.confirmMu.Unlock()
-	e.logger.Infof("held for confirmation: event=%s block=%d safeHead=%d",
-		event.EventName, event.BlockNumber, e.safeHead(e.latestHead.Load()))
-}
-
-func (e *EVMWatcher) pendingConfirmCount() int {
-	e.confirmMu.Lock()
-	defer e.confirmMu.Unlock()
-	return len(e.pendingConfirm)
-}
-
-// flushPendingConfirm delivers held events that have enough confirmations.
-func (e *EVMWatcher) flushPendingConfirm() {
-	safe := e.safeHead(e.latestHead.Load())
-	if safe == 0 {
-		return
-	}
-	e.confirmMu.Lock()
-	n := 0
-	for n < len(e.pendingConfirm) && e.pendingConfirm[n].BlockNumber <= safe {
-		n++
-	}
-	if n == 0 {
-		e.confirmMu.Unlock()
-		return
-	}
-	ready := append([]*Event(nil), e.pendingConfirm[:n]...)
-	e.pendingConfirm = e.pendingConfirm[n:]
-	e.confirmMu.Unlock()
-	for _, event := range ready {
-		e.deliverEvent(event)
-	}
-}
-
 func (e *EVMWatcher) deliverEvent(event *Event) {
-	err := e.event.OnEvent(e.chainName, event)
-	e.pendingEvents.Add(-1)
-	if err != nil {
-		e.logger.Errorf("failed to notify event %s of %s: %v", event.EventName, event.ContractAddress.Hex(), err)
-		return
-	}
-	e.logger.Infof("delivered: event=%s block=%d tx=%s",
-		event.EventName, event.BlockNumber, event.TxHash.Hex())
-	if event.BlockNumber > e.deliveredBlock.Load() {
-		e.deliveredBlock.Store(event.BlockNumber)
-	}
-	e.setLastBlock(event.BlockNumber)
-	e.reportDelivered(event.BlockNumber)
-}
-
-func (e *EVMWatcher) drainPendingOnStop() {
+	ctx := e.context()
+	backoff := deliveryRetryInitial
+	attempt := 0
 	for {
 		select {
-		case event := <-e.eventCh:
-			e.notify(event)
-		default:
-			if e.confirmations > 0 {
-				e.flushPendingConfirm()
-				e.confirmMu.Lock()
-				for range e.pendingConfirm {
-					e.pendingEvents.Add(-1)
-				}
-				e.pendingConfirm = nil
-				e.confirmMu.Unlock()
-			}
+		case <-ctx.Done():
 			return
+		default:
+		}
+		attempt++
+		err := e.event.OnEvent(e.chainName, event)
+		if err == nil {
+			break
+		}
+		e.logger.Errorf("failed to notify event %s of %s: attempt=%d retry_in=%s err=%v",
+			event.EventName, event.ContractAddress.Hex(), attempt, backoff, err)
+		e.logger.Errorf("delivery pending: block=%d tx=%s log_index=%d pending=%d",
+			event.BlockNumber, event.TxHash.Hex(), event.LogIndex, e.pendingEvents.Load())
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < deliveryRetryMax {
+			backoff *= 2
+			if backoff > deliveryRetryMax {
+				backoff = deliveryRetryMax
+			}
 		}
 	}
+	e.pendingEvents.Add(-1)
+	e.logger.Infof("delivered: event=%s block=%d tx=%s",
+		event.EventName, event.BlockNumber, event.TxHash.Hex())
+	for current := e.deliveredBlock.Load(); event.BlockNumber > current; current = e.deliveredBlock.Load() {
+		if e.deliveredBlock.CompareAndSwap(current, event.BlockNumber) {
+			break
+		}
+	}
+	e.progressMu.Lock()
+	if count := e.pendingByBlock[event.BlockNumber]; count <= 1 {
+		delete(e.pendingByBlock, event.BlockNumber)
+	} else {
+		e.pendingByBlock[event.BlockNumber] = count - 1
+	}
+	e.progressMu.Unlock()
+	e.advanceCommittedThrough()
 }
 
-// reportDelivered persists the delivery progress at most once every
-// deliveryReportInterval. The final flush in Stop bypasses the throttle by
-// calling reportWatermark directly.
-func (e *EVMWatcher) reportDelivered(blockNumber uint64) {
-	if e.confirmations == 0 {
-		e.reportWatermark(blockNumber)
+func (e *EVMWatcher) advanceCommittedThrough() {
+	// During catch-up, eventLoop must first merge/register its buffered live
+	// logs. Persisting the scan cursor before that merge recreates a loss window.
+	if e.catchingUp.Load() {
 		return
 	}
-	e.reportMu.Lock()
-	throttled := time.Since(e.lastDeliveryReport) < deliveryReportInterval
-	if !throttled {
-		e.lastDeliveryReport = time.Now()
+	scanned := e.getLastBlock()
+	candidate := scanned
+	e.progressMu.Lock()
+	for block, count := range e.pendingByBlock {
+		if count > 0 && block <= candidate {
+			if block == 0 {
+				candidate = 0
+			} else {
+				candidate = block - 1
+			}
+		}
 	}
-	e.reportMu.Unlock()
-	if throttled {
-		return
+	if candidate > e.committedThrough.Load() {
+		e.committedThrough.Store(candidate)
 	}
-	e.reportWatermark(blockNumber)
-}
-
-// hasBacklog reports whether some received logs or decoded events are still on
-// their way to the caller.
-func (e *EVMWatcher) hasBacklog() bool {
-	if e.pendingConfirmCount() > 0 {
-		return true
+	if candidate > dedupeRetentionBlocks {
+		pruneThrough := candidate - dedupeRetentionBlocks
+		for key, block := range e.seenEvents {
+			if block <= pruneThrough {
+				delete(e.seenEvents, key)
+			}
+		}
 	}
-	return e.pendingEvents.Load() > 0 || len(e.logCh) > 0
+	e.progressMu.Unlock()
+	e.reportWatermark(e.committedThrough.Load())
 }
 
 // reportScannedWatermark persists progress after a FilterLogs scan.
-func (e *EVMWatcher) reportScannedWatermark(scanned uint64) {
-	if e.confirmations > 0 {
-		e.reportWatermark(scanned)
-		return
-	}
-	// In live mode only advance reported up to scanned blocks; delivery may lag
-	// within the scanned range but never skip unscanned blocks.
-	e.reportWatermark(scanned)
+func (e *EVMWatcher) reportScannedWatermark(_ uint64) {
+	e.advanceCommittedThrough()
 }
 
-// reportWatermark persists the progress through SetWatchedBlockNumber. candidate
-// is the block the scan or the stream has reached; while undelivered events
-// remain, only the block before the oldest undelivered one is safe to persist,
-// otherwise a crash would lose the queued events for good.
+// reportWatermark persists at most committedThrough. A failed/queued event keeps
+// committedThrough below its block, so a crash cannot skip that event.
 func (e *EVMWatcher) reportWatermark(candidate uint64) {
+	committed := e.committedThrough.Load()
+	if candidate > committed {
+		candidate = committed
+	}
 	if e.confirmations > 0 {
 		safe := e.safeHead(e.latestHead.Load())
 		if safe == 0 {
@@ -1173,26 +1311,6 @@ func (e *EVMWatcher) reportWatermark(candidate uint64) {
 		}
 		if candidate > safe {
 			candidate = safe
-		}
-	}
-
-	if e.confirmations == 0 {
-		// Never persist beyond the scan cursor without an actual FilterLogs pass.
-		scanned := e.getLastBlock()
-		if candidate > scanned {
-			candidate = scanned
-		}
-	}
-
-	if e.hasBacklog() {
-		delivered := e.deliveredBlock.Load()
-		if delivered == 0 {
-			return
-		}
-		// The oldest undelivered event may sit in the same block as the last
-		// delivered one, so only the block before it is safe.
-		if delivered-1 < candidate {
-			candidate = delivered - 1
 		}
 	}
 
@@ -1209,6 +1327,9 @@ func (e *EVMWatcher) reportWatermark(candidate uint64) {
 }
 
 func (e *EVMWatcher) subscribe() error {
+	e.subscribeMu.Lock()
+	defer e.subscribeMu.Unlock()
+
 	query := e.buildQuery()
 	if len(query.Addresses) == 0 {
 		return fmt.Errorf("no watcher data configured")
@@ -1227,21 +1348,61 @@ func (e *EVMWatcher) subscribe() error {
 	if err := e.waitRequestSlot(ctx); err != nil {
 		return err
 	}
-	sub, err := client.SubscribeFilterLogs(ctx, query, logCh)
+	subscribeCtx, cancel := context.WithTimeout(ctx, filterLogsTimeout)
+	sub, err := client.SubscribeFilterLogs(subscribeCtx, query, logCh)
+	cancel()
 	if err != nil {
 		e.logger.Errorf("subscription failed: %v", err)
 		return fmt.Errorf("failed to subscribe logs: %w", err)
 	}
 
-	e.mu.Lock()
-	old := e.sub
-	e.sub = sub
-	e.mu.Unlock()
+	generation, old := e.installSubscription(sub)
 	if old != nil {
 		old.Unsubscribe()
 	}
-	e.logger.Infof("subscription established")
+	e.forwardSubscriptionErrors(generation, sub)
+	e.logger.Infof("subscription established: generation=%d", generation)
 	return nil
+}
+
+func (e *EVMWatcher) installSubscription(sub ethereum.Subscription) (uint64, ethereum.Subscription) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	old := e.sub
+	e.subGeneration++
+	e.sub = sub
+	return e.subGeneration, old
+}
+
+func (e *EVMWatcher) forwardSubscriptionErrors(generation uint64, sub ethereum.Subscription) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		var err error
+		select {
+		case <-e.context().Done():
+			return
+		case err = <-sub.Err():
+			if err == nil {
+				err = errors.New("subscription error channel closed")
+			}
+		}
+		failure := subscriptionFailure{Generation: generation, Err: err}
+		select {
+		case e.subFailures <- failure:
+		case <-e.context().Done():
+		}
+	}()
+}
+
+func (e *EVMWatcher) isCurrentSubscription(generation uint64) bool {
+	return generation == e.currentSubscriptionGeneration()
+}
+
+func (e *EVMWatcher) currentSubscriptionGeneration() uint64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.subGeneration
 }
 
 // startResubscribe kicks off resubscribe in the background so eventLoop can
@@ -1272,11 +1433,18 @@ func (e *EVMWatcher) startResubscribe() {
 // re-dialed by the rpc client itself on the next call.
 func (e *EVMWatcher) resubscribe() {
 	ctx := e.context()
+	delay := resubscribeDelay
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(resubscribeDelay):
+		case <-time.After(delay):
+		}
+		if delay < maxResubscribeDelay {
+			delay *= 2
+			if delay > maxResubscribeDelay {
+				delay = maxResubscribeDelay
+			}
 		}
 
 		head, err := e.blockNumber(ctx)
@@ -1285,12 +1453,8 @@ func (e *EVMWatcher) resubscribe() {
 			continue
 		}
 		catchTarget := e.catchUpHead(head)
-		if catchTarget > 0 && e.getLastBlock() < catchTarget {
+		if catchTarget > 0 {
 			e.beginCatchUp(catchTarget)
-			if err := e.runCatchUp(ctx, catchTarget); err != nil {
-				e.logger.Errorf("failed to scan the missed blocks: %v", err)
-				continue
-			}
 		}
 		if err := e.subscribe(); err != nil {
 			e.logger.Errorf("failed to resubscribe logs: %v", err)
@@ -1298,6 +1462,7 @@ func (e *EVMWatcher) resubscribe() {
 		}
 		if head, err := e.blockNumber(ctx); err != nil {
 			e.logger.Errorf("failed to get block number after resubscribe: %v", err)
+			continue
 		} else {
 			catchTarget = e.catchUpHead(head)
 			if catchTarget > 0 && e.getLastBlock() < catchTarget {
@@ -1310,8 +1475,8 @@ func (e *EVMWatcher) resubscribe() {
 		}
 
 		e.endCatchUp()
-		e.logger.Infof("log subscription recovered at block %d streaming=%v",
-			e.getLastBlock(), e.isStreaming())
+		e.logger.Infof("log subscription recovery ready: scanned_through=%d; waiting for buffered-log merge",
+			e.getLastBlock())
 		return
 	}
 }
@@ -1345,15 +1510,6 @@ func (e *EVMWatcher) notifyReload() {
 	case e.reloadCh <- struct{}{}:
 	default:
 	}
-}
-
-func (e *EVMWatcher) subError() <-chan error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.sub == nil {
-		return nil
-	}
-	return e.sub.Err()
 }
 
 func (e *EVMWatcher) getReportedBlock() uint64 {
