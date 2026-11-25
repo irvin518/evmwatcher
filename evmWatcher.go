@@ -92,9 +92,17 @@ type EVMWatcher struct {
 	// chainName identifies the watched deployment for storage and callbacks. It
 	// must be unique to the actual network (and contract set when deployments
 	// must not share progress), for example "pharos-mainnet-1672".
-	chainName string
-	wssURL    string
-	ethClient *ethclient.Client
+	chainName              string
+	wssURL                 string
+	ethClient              *ethclient.Client
+	dialClient             func(string) (*ethclient.Client, error)
+	blockNumberProvider    BlockNumberProvider
+	blockNumberChainID     string
+	blockNumberRPCIdentity string
+	sharedLogProvider      *SharedLogProvider
+	sharedLogChainID       string
+	sharedLogRPCIdentity   string
+	chainBackfiller        *ChainBackfiller
 
 	storage StorageInterface
 	event   EventInterface
@@ -109,6 +117,7 @@ type EVMWatcher struct {
 	eventCh     chan *Event
 	sub         ethereum.Subscription
 	started     bool
+	starting    bool
 	// streaming is true only when the log subscription is alive and the gap it
 	// left behind has been scanned, the progress may advance only in that case.
 	streaming bool
@@ -157,6 +166,7 @@ type EVMWatcher struct {
 	progressMu       sync.Mutex
 	pendingByBlock   map[uint64]int
 	seenEvents       map[eventKey]uint64
+	eventDone        map[eventKey]*eventDeliveryAck
 	committedThrough atomic.Uint64
 
 	reloadCh chan struct{}
@@ -185,6 +195,33 @@ type EVMWatcher struct {
 }
 
 type Option func(*EVMWatcher)
+
+// WithBlockNumberProvider overrides chain head reads. The provider is passed the
+// watcher context, RPC client, configured identities and freshness requirement.
+func WithBlockNumberProvider(provider BlockNumberProvider) Option {
+	return func(e *EVMWatcher) { e.blockNumberProvider = provider }
+}
+
+// WithBlockNumberIdentity sets the network and endpoint identities used by a
+// shared head provider. Watcher names and storage keys remain independent.
+// Use the same non-empty identities only for the same network and RPC endpoint.
+func WithBlockNumberIdentity(chainID, rpcIdentity string) Option {
+	return func(e *EVMWatcher) {
+		e.blockNumberChainID = chainID
+		e.blockNumberRPCIdentity = rpcIdentity
+	}
+}
+
+// WithSharedLogProvider optionally shares compatible getLogs queries. Chain ID
+// and RPC identity are explicit and do not affect the watcher's storage key.
+// Callers must use the same identities only for the same network and endpoint.
+func WithSharedLogProvider(provider *SharedLogProvider, chainID, rpcIdentity string) Option {
+	return func(e *EVMWatcher) {
+		e.sharedLogProvider = provider
+		e.sharedLogChainID = chainID
+		e.sharedLogRPCIdentity = rpcIdentity
+	}
+}
 
 // WithMaxBlockRange sets the block span of one eth_getLogs call, it is shrunk
 // automatically when the provider rejects the range.
@@ -275,21 +312,28 @@ func NewEVMWatcher(chainName, wssURL string, watcherData []WatcherData, storage 
 
 func (e *EVMWatcher) Start() error {
 	e.mu.Lock()
-	if e.started {
+	if e.started || e.starting {
 		e.mu.Unlock()
-		return fmt.Errorf("watcher already started")
+		return fmt.Errorf("watcher already started or starting")
 	}
-	if e.storage == nil || e.event == nil {
+	if e.event == nil || (e.storage == nil && e.chainBackfiller == nil) {
 		e.mu.Unlock()
 		return fmt.Errorf("storage and event interface are required")
 	}
+	if e.sharedLogProvider != nil && (e.sharedLogChainID == "" || e.sharedLogRPCIdentity == "") {
+		e.mu.Unlock()
+		return fmt.Errorf("shared log chain ID and RPC identity are required")
+	}
+
 	// Without a chain name several chains would share the same progress key.
 	if e.chainName == "" {
 		e.mu.Unlock()
 		return fmt.Errorf("chain name is required")
 	}
 	watcherData := append([]WatcherData(nil), e.watcherData...)
+	e.starting = true
 	e.mu.Unlock()
+	defer func() { e.mu.Lock(); e.starting = false; e.mu.Unlock() }()
 
 	targets := make(map[common.Address]*watchTarget, len(watcherData))
 	for _, wd := range watcherData {
@@ -303,9 +347,26 @@ func (e *EVMWatcher) Start() error {
 		return fmt.Errorf("no watcher data configured")
 	}
 
-	client, err := ethclient.Dial(e.wssURL)
+	dial := e.dialClient
+	if dial == nil {
+		dial = ethclient.Dial
+	}
+	client, err := dial(e.wssURL)
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s: %w", e.wssURL, err)
+	}
+	if e.chainBackfiller != nil {
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), blockNumberTimeout)
+		chainID, checkErr := client.ChainID(checkCtx)
+		checkCancel()
+		if checkErr != nil {
+			client.Close()
+			return fmt.Errorf("read watcher chain ID: %w", checkErr)
+		}
+		if chainID == nil || chainID.String() != e.chainBackfiller.cfg.ChainID {
+			client.Close()
+			return errors.New("watcher RPC chain ID does not match chain backfiller")
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -324,17 +385,20 @@ func (e *EVMWatcher) Start() error {
 	e.wg.Add(1)
 	go e.notifyLoop()
 
-	head, err := e.blockNumber(ctx)
+	head, err := e.freshBlockNumber(ctx)
 	if err != nil {
 		e.release(cancel, client)
 		return fmt.Errorf("failed to get block number: %w", err)
 	}
 	e.latestHead.Store(head)
 
-	stored, err := e.storage.GetWatchedBlockNumber(e.chainName)
-	if err != nil {
-		e.release(cancel, client)
-		return fmt.Errorf("failed to get watched block number: %w", err)
+	stored := int64(-1)
+	if e.chainBackfiller == nil {
+		stored, err = e.storage.GetWatchedBlockNumber(e.chainName)
+		if err != nil {
+			e.release(cancel, client)
+			return fmt.Errorf("failed to get watched block number: %w", err)
+		}
 	}
 
 	startAt := head
@@ -349,6 +413,11 @@ func (e *EVMWatcher) Start() error {
 	if stored >= 0 {
 		initialBlock = uint64(stored)
 	}
+	// In chain-backfill mode this is only a local dedupe-retention cursor. The
+	// chain's persisted watermark remains exclusively in ChainBackfillStorage.
+	if e.chainBackfiller != nil {
+		initialBlock = 0
+	}
 	// A stopped watcher can be started again. Rebuild all in-memory delivery
 	// state from the durable committed watermark so uncommitted events replay.
 	e.mu.Lock()
@@ -357,6 +426,7 @@ func (e *EVMWatcher) Start() error {
 	e.progressMu.Lock()
 	e.pendingByBlock = make(map[uint64]int)
 	e.seenEvents = make(map[eventKey]uint64)
+	e.eventDone = make(map[eventKey]*eventDeliveryAck)
 	e.progressMu.Unlock()
 	e.pendingEvents.Store(0)
 	e.catchUpTarget.Store(0)
@@ -396,13 +466,13 @@ func (e *EVMWatcher) Start() error {
 
 	// Read the catch-up target after the subscription is live. Logs arriving
 	// during this query remain in logCh and are buffered by eventLoop.
-	postSubscribeHead, err := e.blockNumber(ctx)
+	postSubscribeHead, err := e.freshBlockNumber(ctx)
 	if err != nil {
 		e.Stop()
 		return fmt.Errorf("failed to get block number after subscribing: %w", err)
 	}
 	catchTarget := e.catchUpHead(postSubscribeHead)
-	if catchTarget > 0 && e.getLastBlock() < catchTarget {
+	if e.chainBackfiller == nil && catchTarget > 0 && e.getLastBlock() < catchTarget {
 		e.beginCatchUp(catchTarget)
 	} else {
 		e.setStreaming(true)
@@ -453,6 +523,9 @@ func (e *EVMWatcher) Stop() {
 }
 
 func (e *EVMWatcher) AddWatcher(watcherData WatcherData) error {
+	if e.chainBackfiller != nil {
+		return errors.New("registered chain backfill watcher targets are immutable")
+	}
 	target, err := newWatchTarget(watcherData)
 	if err != nil {
 		return err
@@ -475,6 +548,9 @@ func (e *EVMWatcher) AddWatcher(watcherData WatcherData) error {
 }
 
 func (e *EVMWatcher) RemoveWatcher(watcherData WatcherData) error {
+	if e.chainBackfiller != nil {
+		return errors.New("registered chain backfill watcher targets are immutable")
+	}
 	address := common.HexToAddress(watcherData.ContractAddress)
 
 	e.mu.Lock()
@@ -503,7 +579,7 @@ func (e *EVMWatcher) RemoveWatcher(watcherData WatcherData) error {
 func (e *EVMWatcher) GetWatcherData() []WatcherData {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return append([]WatcherData(nil), e.watcherData...)
+	return cloneChainWatcherData(e.watcherData)
 }
 
 // eventLoop is the only consumer of the log stream, it keeps the delivery order
@@ -592,7 +668,9 @@ func (e *EVMWatcher) eventLoop() {
 			// The blocks missed from now on are unknown, freeze the progress
 			// until the stream is back and the gap is scanned.
 			e.setStreaming(false)
-			e.beginCatchUp(e.latestHead.Load())
+			if e.chainBackfiller == nil {
+				e.beginCatchUp(e.latestHead.Load())
+			}
 			e.logger.Errorf("log subscription broken: generation=%d err=%v", failure.Generation, failure.Err)
 			e.startResubscribe()
 		case <-e.catchUpDoneCh:
@@ -605,7 +683,7 @@ func (e *EVMWatcher) eventLoop() {
 				e.startResubscribe()
 				continue
 			}
-			head, err := e.blockNumber(ctx)
+			head, err := e.freshBlockNumber(ctx)
 			if err != nil {
 				e.logger.Errorf("failed to get reload catch-up head: %v", err)
 				e.startResubscribe()
@@ -813,6 +891,9 @@ func (e *EVMWatcher) effectiveBackfillHeadFrom(from, head uint64) uint64 {
 // maybeGapHeal scans [scannedThrough+1, safeHead] while buffering WSS logs.
 // Safe to call from heartbeat/checkpoint; backfillMu serializes work.
 func (e *EVMWatcher) maybeGapHeal(ctx context.Context, head uint64) {
+	if e.chainBackfiller != nil {
+		return
+	}
 	if e.catchingUp.Load() || !e.isStreaming() {
 		return
 	}
@@ -1023,7 +1104,13 @@ func (e *EVMWatcher) filterLogs(ctx context.Context, from, to uint64) ([]types.L
 			return nil, 0, err
 		}
 		rpcCtx, cancel := context.WithTimeout(ctx, filterLogsTimeout)
-		logs, err := e.client().FilterLogs(rpcCtx, query)
+		var logs []types.Log
+		var err error
+		if e.sharedLogProvider == nil {
+			logs, err = e.client().FilterLogs(rpcCtx, query)
+		} else {
+			logs, err = e.sharedLogProvider.FilterLogs(rpcCtx, e.client(), e.sharedLogChainID, e.sharedLogRPCIdentity, e.confirmations, query)
+		}
 		cancel()
 		if err == nil {
 			return logs, to, nil
@@ -1065,12 +1152,26 @@ func (e *EVMWatcher) filterLogs(ctx context.Context, from, to uint64) ([]types.L
 }
 
 func (e *EVMWatcher) blockNumber(ctx context.Context) (uint64, error) {
+	return e.readBlockNumber(ctx, false)
+}
+
+func (e *EVMWatcher) freshBlockNumber(ctx context.Context) (uint64, error) {
+	return e.readBlockNumber(ctx, true)
+}
+
+func (e *EVMWatcher) readBlockNumber(ctx context.Context, fresh bool) (uint64, error) {
 	if err := e.waitRequestSlot(ctx); err != nil {
 		return 0, err
 	}
 	rpcCtx, cancel := context.WithTimeout(ctx, blockNumberTimeout)
 	defer cancel()
-	head, err := e.client().BlockNumber(rpcCtx)
+	var head uint64
+	var err error
+	if e.blockNumberProvider == nil {
+		head, err = e.client().BlockNumber(rpcCtx)
+	} else {
+		head, err = e.blockNumberProvider.BlockNumber(rpcCtx, e.client(), e.blockNumberChainID, e.blockNumberRPCIdentity, fresh)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1167,17 +1268,41 @@ func keyForEvent(event *Event) eventKey {
 }
 
 func (e *EVMWatcher) registerEvent(event *Event) bool {
+	added, _ := e.registerEventWithAck(event)
+	return added
+}
+
+// registerEventWithAck shares one completion signal between WS and backfill.
+// A nil signal on an existing key means the business callback already returned nil.
+type eventDeliveryAck struct {
+	done chan struct{}
+	err  error
+}
+
+func (e *EVMWatcher) registerEventWithAck(event *Event) (bool, *eventDeliveryAck) {
 	key := keyForEvent(event)
 	e.progressMu.Lock()
 	if _, exists := e.seenEvents[key]; exists {
+		done := e.eventDone[key]
 		e.progressMu.Unlock()
-		return false
+		return false, done
 	}
+	if e.seenEvents == nil {
+		e.seenEvents = make(map[eventKey]uint64)
+	}
+	if e.pendingByBlock == nil {
+		e.pendingByBlock = make(map[uint64]int)
+	}
+	if e.eventDone == nil {
+		e.eventDone = make(map[eventKey]*eventDeliveryAck)
+	}
+	done := &eventDeliveryAck{done: make(chan struct{})}
 	e.seenEvents[key] = event.BlockNumber
 	e.pendingByBlock[event.BlockNumber]++
+	e.eventDone[key] = done
 	e.progressMu.Unlock()
 	e.pendingEvents.Add(1)
-	return true
+	return true, done
 }
 
 // notifyLoop delivers the events to the caller, it is the only goroutine calling
@@ -1250,6 +1375,10 @@ func (e *EVMWatcher) deliverEvent(event *Event) {
 		}
 	}
 	e.progressMu.Lock()
+	if done := e.eventDone[keyForEvent(event)]; done != nil {
+		delete(e.eventDone, keyForEvent(event))
+		close(done.done)
+	}
 	if count := e.pendingByBlock[event.BlockNumber]; count <= 1 {
 		delete(e.pendingByBlock, event.BlockNumber)
 	} else {
@@ -1300,6 +1429,9 @@ func (e *EVMWatcher) reportScannedWatermark(_ uint64) {
 // reportWatermark persists at most committedThrough. A failed/queued event keeps
 // committedThrough below its block, so a crash cannot skip that event.
 func (e *EVMWatcher) reportWatermark(candidate uint64) {
+	if e.chainBackfiller != nil {
+		return
+	}
 	committed := e.committedThrough.Load()
 	if candidate > committed {
 		candidate = committed
@@ -1447,6 +1579,18 @@ func (e *EVMWatcher) resubscribe() {
 			}
 		}
 
+		if e.chainBackfiller != nil {
+			if err := e.subscribe(); err != nil {
+				e.logger.Errorf("failed to resubscribe logs: %v", err)
+				continue
+			}
+			if _, err := e.freshBlockNumber(ctx); err != nil {
+				e.logger.Errorf("failed to get block number after resubscribe: %v", err)
+				continue
+			}
+			e.setStreaming(true)
+			return
+		}
 		head, err := e.blockNumber(ctx)
 		if err != nil {
 			e.logger.Errorf("failed to get block number: %v", err)
@@ -1460,7 +1604,7 @@ func (e *EVMWatcher) resubscribe() {
 			e.logger.Errorf("failed to resubscribe logs: %v", err)
 			continue
 		}
-		if head, err := e.blockNumber(ctx); err != nil {
+		if head, err := e.freshBlockNumber(ctx); err != nil {
 			e.logger.Errorf("failed to get block number after resubscribe: %v", err)
 			continue
 		} else {
